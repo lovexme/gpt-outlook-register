@@ -23,6 +23,11 @@
   </div>
 </header>
 
+<div id="alertBanner" class="alert-banner hidden">
+  <span id="alertBannerMsg"></span>
+  <button id="alertBannerClose">✕</button>
+</div>
+
 <main>
 
   <!-- 左：批量导入 + 注册控制 -->
@@ -92,9 +97,27 @@
           <option value="failed">failed</option>
         </select>
         <button id="btnRefreshPool">刷新</button>
+        <button id="btnResetFailed" title="把所有 failed 号一键重置为 available">🔄 重试 failed</button>
+        <button id="btnReleaseStale" title="把卡在 in_use 超过 30 分钟的号释放回 available">♻️ 释放卡死号</button>
+        <span id="poolActionResult" class="result"></span>
+      </div>
+      <div class="row">
+        <button id="btnDeleteSelected" title="删除已勾选的号" disabled>🗑️ 删除选中 (<span id="selCount">0</span>)</button>
+        <select id="bulkDelStatus" title="按状态批量删除">
+          <option value="">— 按状态批量删 —</option>
+          <option value="failed">删全部 failed</option>
+          <option value="done">删全部 done</option>
+          <option value="available">删全部 available</option>
+          <option value="in_use">删全部 in_use</option>
+          <option value="all">删全部（危险）</option>
+        </select>
+        <button id="btnBulkDelStatus">执行</button>
       </div>
       <table id="poolTable">
-        <thead><tr><th>邮箱</th><th>状态</th><th>失败原因</th><th>操作</th></tr></thead>
+        <thead><tr>
+          <th><input type="checkbox" id="poolSelectAll" title="全选/全不选"></th>
+          <th>邮箱</th><th>状态</th><th>失败原因</th><th>操作</th>
+        </tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -102,9 +125,17 @@
     <div class="tab-content hidden" id="tab-registered">
       <div class="row">
         <button id="btnRefreshReg">刷新</button>
+        <button id="btnExportAll" title="把所有注册结果的完整凭证导出为 JSON 文件">📦 批量导出全部</button>
+        <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
+        <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
+        <button id="btnBulkRefetchRt" title="对选中号串行重走 Codex OAuth 拿 refresh_token" disabled>🔑 重拿选中 RT</button>
+        <span id="exportResult" class="result"></span>
       </div>
       <table id="regTable">
-        <thead><tr><th>邮箱</th><th>access_token</th><th>时间</th><th>操作</th></tr></thead>
+        <thead><tr>
+          <th><input type="checkbox" id="regSelectAll" title="全选/全不选"></th>
+          <th>邮箱</th><th>access_token</th><th>session_token</th><th>refresh_token</th><th>时间</th><th>操作</th>
+        </tr></thead>
         <tbody></tbody>
       </table>
     </div>

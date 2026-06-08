@@ -2022,8 +2022,45 @@ class AuthFlow:
             return None
 
     # ── Step 11: 获取 session ──
+    def _extract_session_cookie(self) -> str:
+        """多路兜底提取 __Secure-next-auth.session-token cookie。
+
+        curl_cffi 在某些情况下按 domain 隔离 cookie，session.cookies.get(name) 拿不到，
+        所以这里把所有 cookie 都遍历一遍，按名字精确匹配。
+        """
+        target = "__Secure-next-auth.session-token"
+        # 路径1：直接 get
+        try:
+            v = self.session.cookies.get(target, "")
+            if v:
+                return v
+        except Exception:
+            pass
+        # 路径2：遍历 jar
+        try:
+            for c in self.session.cookies:
+                name = getattr(c, "name", "") if hasattr(c, "name") else str(c)
+                if name == target:
+                    val = getattr(c, "value", "") or ""
+                    if val:
+                        return val
+        except Exception:
+            pass
+        # 路径3：用 _get_cookie_value_by_name（不挑 domain）
+        try:
+            return self._get_cookie_value_by_name(target)
+        except Exception:
+            return ""
+
     def get_auth_session(self) -> tuple[str, str]:
-        """获取 session_token 和 access_token。"""
+        """获取 session_token 和 access_token。
+
+        session_token 三路兜底（按优先级）：
+          1. cookie `__Secure-next-auth.session-token`（NextAuth 数据库 session 策略）
+          2. JSON 响应里的 `sessionToken` 字段（NextAuth JWT session 策略，某些路径）
+          3. 兼容大小写 / 下划线变体
+        access_token 取 JSON 响应里的 `accessToken`。
+        """
         logger.info("[10/10] 获取认证 Session...")
         headers = self._common_headers("https://chatgpt.com/")
         resp = self.session.get(
@@ -2041,8 +2078,14 @@ class AuthFlow:
         if not isinstance(sess_json, dict):
             sess_json = {}
 
-        session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
-        access_token = sess_json.get("accessToken", "") or ""
+        cookie_st = self._extract_session_cookie()
+        json_st = (
+            sess_json.get("sessionToken", "")
+            or sess_json.get("session_token", "")
+            or ""
+        )
+        session_token = cookie_st or json_st
+        access_token = sess_json.get("accessToken", "") or sess_json.get("access_token", "") or ""
 
         if session_token:
             self.result.session_token = session_token
@@ -2050,8 +2093,13 @@ class AuthFlow:
             self.result.access_token = access_token
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
-        logger.info(f"session_token: {'有' if session_token else '无'}, "
-                     f"access_token: {'有' if access_token else '无'}")
+        logger.info(
+            f"session_token: cookie={'有(len=%d)' % len(cookie_st) if cookie_st else '无'} "
+            f"json={'有(len=%d)' % len(json_st) if json_st else '无'} "
+            f"→ 最终={'有(len=%d)' % len(session_token) if session_token else '无'}; "
+            f"access_token={'有(len=%d)' % len(access_token) if access_token else '无'}; "
+            f"json_keys={list(sess_json.keys())[:10]}"
+        )
         return session_token, access_token
 
     def _consume_callback_for_session(self, callback_url: str) -> bool:

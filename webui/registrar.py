@@ -75,6 +75,35 @@ def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
 
 
+# 网络/环境层错误特征：命中任一就把号放回 available（号本身没问题，是环境炸了）
+_NETWORK_ERROR_PATTERNS = [
+    "tls", "ssl", "sslerror", "connection", "connect error", "timeout", "timed out",
+    "proxy", "socks", "dns", "name resolution", "name or service",
+    "cloudflare", "just a moment", "403 forbidden",
+    "csrf token 获取失败", "csrf token 失败",
+    "/sentinel/req", "sentinel /req", "sentinel quickjs",
+    "check_proxy 失败", "网络预检查",
+    "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
+    "remote disconnected", "connection reset", "connection aborted",
+    "max retries exceeded",
+]
+
+
+def classify_error(err: str) -> str:
+    """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。"""
+    s = (err or "").lower()
+    # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
+    if any(p in s for p in (
+        "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
+        "outlook otp timeout", "registration_disallowed",
+        "已有账号", "账号被", "refresh_token 失效",
+    )):
+        return "account"
+    if any(p in s for p in _NETWORK_ERROR_PATTERNS):
+        return "network"
+    return "unknown"
+
+
 def _do_register(
     run_id: str,
     account: dict,
@@ -203,11 +232,18 @@ def _do_register(
 
     except Exception as e:
         err = str(e)
-        logging.getLogger("registrar").error(f"[register] 失败: {err}")
+        category = classify_error(err)
+        logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         logging.getLogger("registrar").error(traceback.format_exc())
-        db.mark_failed(email, err)
-        db.finish_run(run_id, "failed", err)
-        _emit_status(run_id, "error", {"message": err})
+        if category == "network":
+            db.release_unused(email)
+            logging.getLogger("registrar").warning(
+                f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
+            )
+        else:
+            db.mark_failed(email, f"[{category}] {err}")
+        db.finish_run(run_id, "failed", err, category=category)
+        _emit_status(run_id, "error", {"message": err, "category": category})
 
     finally:
         # 还原 env

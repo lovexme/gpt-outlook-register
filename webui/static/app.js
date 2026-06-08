@@ -97,8 +97,8 @@ $("#btnRun").addEventListener("click", async () => {
     proxy: $("#regProxy").value.trim(),
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
     want_access_token: true,
-    want_session_token: false,
-    want_refresh_token: false,
+    want_session_token: true,
+    want_refresh_token: true,
   };
   $("#btnRun").disabled = true;
   $("#runStatus").textContent = "启动中...";
@@ -207,6 +207,7 @@ async function refreshPool() {
   for (const r of items) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
+      <td><input type="checkbox" class="pool-check" data-email="${r.email}"></td>
       <td>${r.email}</td>
       <td><span class="status ${r.status}">${r.status}</span></td>
       <td title="${r.fail_reason || ''}">${(r.fail_reason || '').slice(0, 50)}</td>
@@ -217,9 +218,107 @@ async function refreshPool() {
     `;
     tb.appendChild(tr);
   }
+  $("#poolSelectAll").checked = false;
+  _updateSelCount();
 }
 $("#btnRefreshPool").addEventListener("click", refreshPool);
 $("#poolFilter").addEventListener("change", refreshPool);
+
+$("#btnResetFailed").addEventListener("click", async () => {
+  if (!confirm("把所有 failed 号重置为 available？")) return;
+  $("#poolActionResult").textContent = "处理中...";
+  $("#poolActionResult").className = "result";
+  try {
+    const r = await api("/api/accounts/reset_failed", { method: "POST" });
+    $("#poolActionResult").textContent = `✅ 重置 ${r.reset} 个号为 available`;
+    $("#poolActionResult").className = "result ok";
+    refreshPool(); refreshStats();
+  } catch (e) {
+    $("#poolActionResult").textContent = "❌ " + e.message;
+    $("#poolActionResult").className = "result bad";
+  }
+});
+
+$("#btnReleaseStale").addEventListener("click", async () => {
+  $("#poolActionResult").textContent = "处理中...";
+  $("#poolActionResult").className = "result";
+  try {
+    const r = await api("/api/accounts/release_stale", { method: "POST" });
+    $("#poolActionResult").textContent = `✅ 释放 ${r.released} 个卡死号`;
+    $("#poolActionResult").className = "result ok";
+    refreshPool(); refreshStats();
+  } catch (e) {
+    $("#poolActionResult").textContent = "❌ " + e.message;
+    $("#poolActionResult").className = "result bad";
+  }
+});
+
+// ── 号池：复选框选择 + 批量删除 ──
+
+function _selectedEmails() {
+  return Array.from(document.querySelectorAll(".pool-check:checked"))
+    .map(c => c.dataset.email);
+}
+function _updateSelCount() {
+  const n = _selectedEmails().length;
+  $("#selCount").textContent = n;
+  $("#btnDeleteSelected").disabled = n === 0;
+}
+$("#poolTable").addEventListener("change", (e) => {
+  if (e.target.classList.contains("pool-check")) _updateSelCount();
+});
+$("#poolSelectAll").addEventListener("change", (e) => {
+  document.querySelectorAll(".pool-check").forEach(c => c.checked = e.target.checked);
+  _updateSelCount();
+});
+
+$("#btnDeleteSelected").addEventListener("click", async () => {
+  const emails = _selectedEmails();
+  if (!emails.length) return;
+  if (!confirm(`确定删除选中的 ${emails.length} 个号？(不可恢复)`)) return;
+  $("#poolActionResult").textContent = "删除中...";
+  $("#poolActionResult").className = "result";
+  try {
+    const r = await api("/api/accounts/bulk_delete", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    $("#poolActionResult").textContent = `✅ 已删除 ${r.deleted} 个号`;
+    $("#poolActionResult").className = "result ok";
+    refreshPool(); refreshStats();
+  } catch (e) {
+    $("#poolActionResult").textContent = "❌ " + e.message;
+    $("#poolActionResult").className = "result bad";
+  }
+});
+
+$("#btnBulkDelStatus").addEventListener("click", async () => {
+  const status = $("#bulkDelStatus").value;
+  if (!status) {
+    $("#poolActionResult").textContent = "请先选择要删除的状态";
+    $("#poolActionResult").className = "result bad";
+    return;
+  }
+  const tip = status === "all"
+    ? "⚠️ 这会删除号池里所有号（含未注册的），确定？"
+    : `确定删除全部 ${status} 状态的号？`;
+  if (!confirm(tip)) return;
+  $("#poolActionResult").textContent = "删除中...";
+  $("#poolActionResult").className = "result";
+  try {
+    const r = await api("/api/accounts/bulk_delete", {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    });
+    $("#poolActionResult").textContent = `✅ 已删除 ${r.deleted} 个 ${status} 号`;
+    $("#poolActionResult").className = "result ok";
+    $("#bulkDelStatus").value = "";
+    refreshPool(); refreshStats();
+  } catch (e) {
+    $("#poolActionResult").textContent = "❌ " + e.message;
+    $("#poolActionResult").className = "result bad";
+  }
+});
 
 $("#poolTable").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
@@ -245,15 +344,156 @@ async function refreshRegistered() {
   for (const r of items) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
+      <td><input type="checkbox" class="reg-check" data-email="${r.email}"></td>
       <td>${r.email}</td>
       <td>${r.at_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="access_token" title="点击复制 access_token">✅ ${r.at_len} 📋</button>` : "—"}</td>
+      <td>${r.st_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="session_token" title="点击复制 session_token">✅ ${r.st_len} 📋</button>` : "—"}</td>
+      <td>${r.rt_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="refresh_token" title="点击复制 refresh_token">✅ ${r.rt_len} 📋</button>` : "—"}</td>
       <td>${fmtTime(r.created_at)}</td>
-      <td><button data-act="view" data-email="${r.email}">查看凭证</button></td>
+      <td>
+        <button data-act="view" data-email="${r.email}">查看凭证</button>
+        <button data-act="refetch_rt" data-email="${r.email}" title="重新走 Codex OAuth 拿 refresh_token">🔑 RT</button>
+        <button data-act="del" data-email="${r.email}">删除</button>
+      </td>
     `;
     tb.appendChild(tr);
   }
+  $("#regSelectAll").checked = false;
+  _updateSelCountReg();
 }
 $("#btnRefreshReg").addEventListener("click", refreshRegistered);
+
+// ── 注册结果：复选框 + 批量删 + 单行删 ──
+
+function _selectedRegEmails() {
+  return Array.from(document.querySelectorAll(".reg-check:checked")).map(c => c.dataset.email);
+}
+function _updateSelCountReg() {
+  const n = _selectedRegEmails().length;
+  $("#selCountReg").textContent = n;
+  $("#btnDeleteSelectedReg").disabled = n === 0;
+  $("#btnBulkRefetchRt").disabled = n === 0;
+}
+$("#regTable").addEventListener("change", (e) => {
+  if (e.target.classList.contains("reg-check")) _updateSelCountReg();
+});
+$("#regSelectAll").addEventListener("change", (e) => {
+  document.querySelectorAll(".reg-check").forEach(c => c.checked = e.target.checked);
+  _updateSelCountReg();
+});
+
+$("#btnDeleteSelectedReg").addEventListener("click", async () => {
+  const emails = _selectedRegEmails();
+  if (!emails.length) return;
+  if (!confirm(`确定删除选中的 ${emails.length} 条凭证？(不可恢复)`)) return;
+  $("#exportResult").textContent = "删除中...";
+  $("#exportResult").className = "result";
+  try {
+    const r = await api("/api/registered/bulk_delete", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    $("#exportResult").textContent = `✅ 已删除 ${r.deleted} 条凭证`;
+    $("#exportResult").className = "result ok";
+    refreshRegistered();
+  } catch (e) {
+    $("#exportResult").textContent = "❌ " + e.message;
+    $("#exportResult").className = "result bad";
+  }
+});
+
+$("#btnDeleteAllReg").addEventListener("click", async () => {
+  if (!confirm("⚠️ 这会清空注册结果表里的所有凭证！\n确定继续？（号池不受影响）")) return;
+  if (!confirm("再次确认：真的要删除全部凭证吗？此操作不可恢复！")) return;
+  $("#exportResult").textContent = "清空中...";
+  $("#exportResult").className = "result";
+  try {
+    const r = await api("/api/registered/bulk_delete", {
+      method: "POST",
+      body: JSON.stringify({ all: true }),
+    });
+    $("#exportResult").textContent = `✅ 已清空 ${r.deleted} 条凭证`;
+    $("#exportResult").className = "result ok";
+    refreshRegistered();
+  } catch (e) {
+    $("#exportResult").textContent = "❌ " + e.message;
+    $("#exportResult").className = "result bad";
+  }
+});
+
+$("#btnBulkRefetchRt").addEventListener("click", async () => {
+  const emails = _selectedRegEmails();
+  if (!emails.length) return;
+  if (!confirm(`对选中的 ${emails.length} 个号串行重走 Codex OAuth 拿 refresh_token？\n已有 RT 的号会自动跳过；缺 RT 的号每个 ~10s`)) return;
+  $("#exportResult").textContent = `处理中 0/${emails.length}...`;
+  $("#exportResult").className = "result";
+  const proxy = $("#regProxy").value.trim();
+  try {
+    const r = await api("/api/registered/bulk_refetch_rt", {
+      method: "POST",
+      body: JSON.stringify({ emails, proxy, force: false }),
+    });
+    $("#exportResult").textContent = `✅ 完成: 新拿到 ${r.newly_got || 0} 个 / 跳过 ${r.skipped || 0} 个 / 失败 ${r.total - r.succeeded} 个`;
+    $("#exportResult").className = "result ok";
+    for (const item of r.results || []) {
+      if (item.skipped) {
+        logLine(`[refetch] ⏭️  ${item.email} 已有 RT (len=${item.refresh_token_len})`, "evt");
+      } else if (item.ok) {
+        logLine(`[refetch] ✅ ${item.email} RT len=${item.refresh_token_len}`, "ok");
+      } else {
+        logLine(`[refetch] ❌ ${item.email}: ${item.error || "失败"}`, "err");
+      }
+    }
+    _credCache = null;
+    refreshRegistered();
+  } catch (e) {
+    $("#exportResult").textContent = "❌ " + e.message;
+    $("#exportResult").className = "result bad";
+  }
+});
+
+$("#btnExportAll").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "⏳ 导出中...";
+  $("#exportResult").textContent = "";
+  $("#exportResult").className = "result";
+  try {
+    const resp = await fetch("/api/registered/export?limit=10000");
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || resp.statusText);
+    }
+    const count = parseInt(resp.headers.get("X-Account-Count") || "0", 10);
+    if (!count) {
+      $("#exportResult").textContent = "❌ 没有可导出的注册结果";
+      $("#exportResult").className = "result bad";
+      return;
+    }
+    const blob = await resp.blob();
+    // 取后端给的文件名（attachment; filename="..."）
+    const dispo = resp.headers.get("Content-Disposition") || "";
+    const m = dispo.match(/filename="([^"]+)"/);
+    const fname = m ? m[1] : `gpt-accounts-${Date.now()}.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    $("#exportResult").textContent = `✅ 已下载 ${count} 个号的 ZIP 包`;
+    $("#exportResult").className = "result ok";
+  } catch (err) {
+    $("#exportResult").textContent = "❌ " + err.message;
+    $("#exportResult").className = "result bad";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+});
 
 // 缓存最近查看的凭证（用于"复制全部 JSON"按钮和单字段复制）
 let _credCache = null;
@@ -304,6 +544,55 @@ $("#regTable").addEventListener("click", async (e) => {
       const cred = await _loadCred(email);
       _renderCredModal(email, cred);
     } catch (err) { alert("加载凭证失败: " + err.message); }
+  }
+
+  // 「删除」单行删
+  if (btn.dataset.act === "del") {
+    if (!confirm(`删除 ${email} 的凭证？`)) return;
+    try {
+      await api(`/api/registered/${encodeURIComponent(email)}`, { method: "DELETE" });
+      refreshRegistered();
+    } catch (err) { alert("删除失败: " + err.message); }
+  }
+
+  // 「🔑 RT」单行重拿 refresh_token
+  if (btn.dataset.act === "refetch_rt") {
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "⏳";
+    try {
+      const proxy = $("#regProxy").value.trim();
+      // 第一次 force=false：已有 RT 会跳过
+      let r = await api("/api/registered/refetch_rt", {
+        method: "POST",
+        body: JSON.stringify({ email, proxy, force: false }),
+      });
+      if (r.skipped) {
+        // 已有 RT，询问是否强制覆盖
+        const ok = confirm(`${email} 已有 refresh_token (len=${r.refresh_token_len})\n是否强制重新拿一次覆盖？（一般不需要）`);
+        if (!ok) {
+          logLine(`[refetch] ⏭️  ${email} 已有 RT，跳过`, "evt");
+          return;
+        }
+        r = await api("/api/registered/refetch_rt", {
+          method: "POST",
+          body: JSON.stringify({ email, proxy, force: true }),
+        });
+      }
+      if (r.ok) {
+        logLine(`[refetch] ✅ ${email} 拿到 RT (len=${r.refresh_token_len})`, "ok");
+        if (_credCache && _credCache.email === email) _credCache = null;
+        refreshRegistered();
+      } else {
+        logLine(`[refetch] ❌ ${email}: ${r.error}`, "err");
+        alert("失败: " + r.error);
+      }
+    } catch (err) {
+      alert("失败: " + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
   }
 });
 
@@ -417,8 +706,8 @@ function _autoOptions() {
     proxy: $("#regProxy").value.trim(),
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
     want_access_token: true,
-    want_session_token: false,
-    want_refresh_token: false,
+    want_session_token: true,
+    want_refresh_token: true,
     cool_down_seconds: parseFloat($("#autoCoolDown").value || "3") || 0,
   };
 }
@@ -478,7 +767,15 @@ function _connectAutoStream() {
   es.addEventListener("run_finished", (e) => {
     try {
       const d = JSON.parse(e.data);
-      logLine(`[auto] ${d.ok ? "✅" : "❌"} ${d.email} 完成`, d.ok ? "ok" : "err");
+      const tag = d.ok ? "✅" : (d.category === "network" ? "🌐 网络错误（号已 release）" : "❌");
+      logLine(`[auto] ${tag} ${d.email} 完成`, d.ok ? "ok" : "err");
+    } catch (_) {}
+  });
+  es.addEventListener("circuit_break", (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      logLine(`[auto] ⚠️ 熔断: ${d.reason}`, "err");
+      _showBanner(d.reason);
     } catch (_) {}
   });
   es.onerror = () => {
@@ -488,6 +785,16 @@ function _connectAutoStream() {
     setTimeout(_connectAutoStream, 2000);
   };
 }
+
+// 顶部红色告警横幅
+function _showBanner(msg) {
+  const b = $("#alertBanner");
+  $("#alertBannerMsg").textContent = msg;
+  b.classList.remove("hidden");
+}
+$("#alertBannerClose").addEventListener("click", () => {
+  $("#alertBanner").classList.add("hidden");
+});
 
 // ──────────────────────── 表单持久化（localStorage 自动保存/恢复）────────────────────────
 

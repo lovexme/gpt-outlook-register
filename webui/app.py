@@ -8,9 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import re
 import sys
+import time
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +28,15 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from .refetch_rt import refetch_refresh_token  # noqa: E402
+
+# 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
+try:
+    _released = db.release_stale_in_use(stale_seconds=1800)
+    if _released > 0:
+        logging.getLogger("webui").info(f"[startup] 释放 {_released} 个卡死的 in_use 号")
+except Exception as _e:
+    logging.getLogger("webui").warning(f"[startup] release_stale 失败: {_e}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +92,35 @@ def api_delete_account(email: str):
     if not ok:
         raise HTTPException(404, "not found")
     return {"ok": True}
+
+
+class BulkDeleteReq(BaseModel):
+    status: Optional[str] = Field(None, description="available/in_use/done/failed/all")
+    emails: Optional[list[str]] = Field(None, description="按 email 列表删")
+
+
+@app.post("/api/accounts/bulk_delete")
+def api_bulk_delete(req: BulkDeleteReq):
+    """按状态或 email 列表批量删除号池。两个参数二选一（status 优先）。"""
+    if req.status:
+        n = db.delete_accounts_by_status(req.status)
+        return {"ok": True, "deleted": n, "by": "status", "stats": db.stats()}
+    if req.emails:
+        n = db.delete_accounts_by_emails(req.emails)
+        return {"ok": True, "deleted": n, "by": "emails", "stats": db.stats()}
+    raise HTTPException(400, "需要 status 或 emails")
+
+
+@app.post("/api/accounts/reset_failed")
+def api_reset_failed():
+    n = db.reset_failed_to_available()
+    return {"ok": True, "reset": n, "stats": db.stats()}
+
+
+@app.post("/api/accounts/release_stale")
+def api_release_stale(stale_seconds: int = 1800):
+    n = db.release_stale_in_use(stale_seconds=stale_seconds)
+    return {"ok": True, "released": n, "stats": db.stats()}
 
 
 @app.get("/api/stats")
@@ -165,12 +207,113 @@ def api_registered(limit: int = 500):
     return {"ok": True, "items": db.list_registered(limit=limit)}
 
 
+@app.get("/api/registered/export")
+def api_registered_export(limit: int = 5000):
+    """批量导出：每个号一个 JSON 打包成 ZIP 下载。"""
+    items = db.list_registered_full(limit=limit)
+    buf = io.BytesIO()
+    safe_re = re.compile(r"[^A-Za-z0-9._@-]")
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            email = (item.get("email") or "unknown").strip()
+            base = safe_re.sub("_", email) or "unknown"
+            name = f"{base}.json"
+            # 同名去重（理论上 email 唯一就够，但保险）
+            i = 2
+            while name in used_names:
+                name = f"{base}_{i}.json"
+                i += 1
+            used_names.add(name)
+            zf.writestr(name, json.dumps(item, ensure_ascii=False, indent=2))
+    buf.seek(0)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="gpt-accounts-{ts}.zip"',
+            "X-Account-Count": str(len(items)),
+        },
+    )
+
+
 @app.get("/api/registered/{email}")
 def api_registered_one(email: str):
     row = db.get_registered(email)
     if not row:
         raise HTTPException(404, "not found")
     return {"ok": True, "data": row}
+
+
+@app.delete("/api/registered/{email}")
+def api_delete_registered(email: str):
+    ok = db.delete_registered(email)
+    if not ok:
+        raise HTTPException(404, "not found")
+    return {"ok": True}
+
+
+class BulkDeleteRegisteredReq(BaseModel):
+    emails: Optional[list[str]] = Field(None, description="按 email 列表删；留空 + all=true 则删全部")
+    all: bool = False
+
+
+@app.post("/api/registered/bulk_delete")
+def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
+    if req.all:
+        n = db.delete_all_registered()
+        return {"ok": True, "deleted": n, "by": "all"}
+    if req.emails:
+        n = db.delete_registered_by_emails(req.emails)
+        return {"ok": True, "deleted": n, "by": "emails"}
+    raise HTTPException(400, "需要 emails 或 all=true")
+
+
+class RefetchRtReq(BaseModel):
+    email: str
+    proxy: str = ""
+    force: bool = False
+
+
+@app.post("/api/registered/refetch_rt")
+def api_refetch_rt(req: RefetchRtReq):
+    """对已注册号重新走一次 Codex OAuth 拿 refresh_token。
+
+    force=False（默认）：已有 RT 直接跳过
+    force=True：即使有 RT 也强制再拿一次（覆盖旧 RT）
+    """
+    result = refetch_refresh_token(req.email, proxy=(req.proxy or None), force=req.force)
+    return {"ok": result.get("ok", False), **result}
+
+
+class BulkRefetchRtReq(BaseModel):
+    emails: list[str]
+    proxy: str = ""
+    force: bool = False
+
+
+@app.post("/api/registered/bulk_refetch_rt")
+def api_bulk_refetch_rt(req: BulkRefetchRtReq):
+    """批量重试 refresh_token。串行跑（每个号 ~10s）。已有 RT 的号会自动跳过（除非 force=true）。"""
+    results = []
+    for email in req.emails:
+        try:
+            r = refetch_refresh_token(email, proxy=(req.proxy or None), force=req.force)
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        results.append({"email": email, **r})
+    ok_count = sum(1 for r in results if r.get("ok"))
+    skipped = sum(1 for r in results if r.get("skipped"))
+    new_got = ok_count - skipped
+    return {
+        "ok": True,
+        "total": len(results),
+        "succeeded": ok_count,
+        "newly_got": new_got,
+        "skipped": skipped,
+        "results": results,
+    }
 
 
 # ──────────────────────── auto-loop ────────────────────────

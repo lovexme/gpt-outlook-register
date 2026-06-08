@@ -52,6 +52,10 @@ class AutoLoopController:
         self._current_email = ""
         self._current_run_id = ""
         self._last_message = ""
+        # 熔断状态
+        self._consecutive_network_fails = 0
+        self._circuit_break_threshold = 3  # 连续 N 次网络错误自动暂停
+        self._last_break_reason = ""
         # SSE 订阅
         self._subscribers: list[queue.Queue] = []
 
@@ -219,23 +223,47 @@ class AutoLoopController:
             self._broadcast("run_started", {"email": account["email"], "run_id": run_id})
 
             # 等当前 run 跑完（轮询 DB runs 表 status）
-            ok = self._wait_run_finish(run_id)
+            ok, category = self._wait_run_finish(run_id)
             with self._lock:
                 if ok:
                     self._registered_ok += 1
+                    self._consecutive_network_fails = 0
                 else:
                     self._registered_fail += 1
+                    if category == "network":
+                        self._consecutive_network_fails += 1
+                    else:
+                        self._consecutive_network_fails = 0
                 self._current_email = ""
                 self._current_run_id = ""
                 self._last_message = (
-                    f"上一个号完成 ({'成功' if ok else '失败'})，"
+                    f"上一个号完成 ({'成功' if ok else f'失败/{category or 'unknown'}'})，"
                     f"累计 ok={self._registered_ok} fail={self._registered_fail}"
+                )
+                # 熔断判断
+                trigger_break = (
+                    self._consecutive_network_fails >= self._circuit_break_threshold
+                    and self._state == AutoLoopState.RUNNING
                 )
             self._broadcast("state", self._snapshot())
             self._broadcast(
                 "run_finished",
-                {"email": account["email"], "run_id": run_id, "ok": ok},
+                {"email": account["email"], "run_id": run_id, "ok": ok, "category": category},
             )
+
+            if trigger_break:
+                with self._lock:
+                    self._pause_event.set()
+                    self._state = AutoLoopState.PAUSED
+                    self._last_break_reason = (
+                        f"连续 {self._consecutive_network_fails} 次网络/环境错误，"
+                        f"自动暂停（号已自动 release，请检查代理后点恢复）"
+                    )
+                    self._last_message = self._last_break_reason
+                    self._consecutive_network_fails = 0  # 重置计数，恢复后重新计
+                logger.warning(self._last_break_reason)
+                self._broadcast("circuit_break", {"reason": self._last_break_reason})
+                self._broadcast("state", self._snapshot())
 
             # 给 OpenAI 喘口气，免得连续打太狠被风控
             cool_down = float(self._options.get("cool_down_seconds") or 3)
@@ -245,25 +273,30 @@ class AutoLoopController:
                         break
                     time.sleep(0.1)
 
-    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> bool:
-        """轮询 runs 表，等 run 跑完。返回 True=done, False=failed/timeout。"""
+    def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
+        """轮询 runs 表，等 run 跑完。返回 (ok, error_category)。
+
+        ok=True 时 category=""
+        ok=False 时 category 为 'network' / 'account' / 'unknown' / ''（超时为""）
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # 强制停止 → 不等了
             if self._stop_event.is_set():
-                return False
+                return False, ""
             con = db._conn()
-            cur = con.execute("SELECT status FROM runs WHERE run_id=?", (run_id,))
+            cur = con.execute(
+                "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
+            )
             row = cur.fetchone()
             if row:
                 st = row["status"]
                 if st == "done":
-                    return True
+                    return True, ""
                 if st == "failed":
-                    return False
+                    return False, (row["error_category"] or "")
             time.sleep(1)
         logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
-        return False
+        return False, ""
 
 
 # 全局单例

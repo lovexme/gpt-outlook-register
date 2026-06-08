@@ -64,10 +64,17 @@ def init_db():
             started_at      REAL,
             finished_at     REAL,
             log_path        TEXT,
-            error           TEXT
+            error           TEXT,
+            error_category  TEXT         -- network / account / unknown
         );
     """)
     con.commit()
+    # 老 DB migrate：error_category 在后期才加，对已建表补列
+    cur = con.execute("PRAGMA table_info(runs)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "error_category" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+        con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -233,12 +240,77 @@ def release_unused(email: str) -> None:
         con.commit()
 
 
+def reset_failed_to_available() -> int:
+    """把所有 failed 号一次性重置为 available（清掉 fail_reason）。返回受影响行数。
+
+    场景：代理短暂抽风导致一波号被冤枉标 failed，主人想给它们一次机会。
+    """
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE outlook_accounts SET status='available', fail_reason=NULL, "
+            "finished_at=NULL WHERE status='failed'"
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def release_stale_in_use(stale_seconds: float = 1800) -> int:
+    """把 claimed_at 超过 N 秒还在 in_use 的号释放回 available。
+
+    场景：上次 webui 强退/进程崩溃，号卡在 in_use 永远不释放。默认 30 分钟。
+    """
+    with _lock:
+        con = _conn()
+        cutoff = time.time() - stale_seconds
+        rc = con.execute(
+            "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
+            "WHERE status='in_use' AND (claimed_at IS NULL OR claimed_at < ?)",
+            (cutoff,),
+        )
+        con.commit()
+        return rc.rowcount
+
+
 def delete_account(email: str) -> bool:
     with _lock:
         con = _conn()
         rc = con.execute("DELETE FROM outlook_accounts WHERE email=?", (email.lower(),))
         con.commit()
         return rc.rowcount > 0
+
+
+def delete_accounts_by_status(status: str) -> int:
+    """按状态批量删除。status 必须是 available/in_use/done/failed 之一；
+    传 'all' 删全部。返回受影响行数。"""
+    valid = {"available", "in_use", "done", "failed", "all"}
+    s = (status or "").strip().lower()
+    if s not in valid:
+        return 0
+    with _lock:
+        con = _conn()
+        if s == "all":
+            rc = con.execute("DELETE FROM outlook_accounts")
+        else:
+            rc = con.execute("DELETE FROM outlook_accounts WHERE status=?", (s,))
+        con.commit()
+        return rc.rowcount
+
+
+def delete_accounts_by_emails(emails: list[str]) -> int:
+    """按 email 列表批量删除。返回受影响行数。"""
+    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        placeholders = ",".join("?" * len(cleaned))
+        rc = con.execute(
+            f"DELETE FROM outlook_accounts WHERE email IN ({placeholders})",
+            cleaned,
+        )
+        con.commit()
+        return rc.rowcount
 
 
 def stats() -> dict:
@@ -305,6 +377,26 @@ def list_registered(limit: int = 500) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def list_registered_full(limit: int = 5000) -> list[dict]:
+    """返回完整凭证（用于批量导出）。每行同 get_registered 的格式。"""
+    con = _conn()
+    cur = con.execute(
+        "SELECT * FROM registered ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    out = []
+    for row in cur.fetchall():
+        d = dict(row)
+        if d.get("extra_json"):
+            try:
+                d["extra"] = json.loads(d["extra_json"])
+            except Exception:
+                d["extra"] = {}
+        d.pop("extra_json", None)
+        out.append(d)
+    return out
+
+
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
     cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
@@ -321,6 +413,37 @@ def get_registered(email: str) -> Optional[dict]:
     return out
 
 
+def delete_registered(email: str) -> bool:
+    with _lock:
+        con = _conn()
+        rc = con.execute("DELETE FROM registered WHERE email=?", (email.lower(),))
+        con.commit()
+        return rc.rowcount > 0
+
+
+def delete_registered_by_emails(emails: list[str]) -> int:
+    cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        placeholders = ",".join("?" * len(cleaned))
+        rc = con.execute(
+            f"DELETE FROM registered WHERE email IN ({placeholders})",
+            cleaned,
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def delete_all_registered() -> int:
+    with _lock:
+        con = _conn()
+        rc = con.execute("DELETE FROM registered")
+        con.commit()
+        return rc.rowcount
+
+
 # ──────────────────────── 运行记录 ────────────────────────
 
 
@@ -335,12 +458,12 @@ def create_run(run_id: str, email: str, log_path: str) -> None:
         con.commit()
 
 
-def finish_run(run_id: str, status: str, error: str = "") -> None:
+def finish_run(run_id: str, status: str, error: str = "", category: str = "") -> None:
     with _lock:
         con = _conn()
         con.execute(
-            "UPDATE runs SET status=?, finished_at=?, error=? WHERE run_id=?",
-            (status, time.time(), (error or "")[:500], run_id),
+            "UPDATE runs SET status=?, finished_at=?, error=?, error_category=? WHERE run_id=?",
+            (status, time.time(), (error or "")[:500], category or None, run_id),
         )
         con.commit()
 
