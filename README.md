@@ -1,5 +1,10 @@
 # ChatGPT 注册（纯协议 + Outlook 邮箱版）—— 最小化提取包
 
+技术交流群：259844673
+
+
+<img width="280" height="265" alt="image" src="https://github.com/user-attachments/assets/a24f9f9b-0dfa-440e-8ee8-6e461d03eeea" />
+
 从 `DanOps-1/Gpt-Agreement-Payment` 仓库剥离出的「**纯协议注册 + Outlook 邮箱**」最小工具集。
 **完全无浏览器**：用 `curl_cffi` 模拟 TLS 指纹 + 纯 Python/QuickJS 解 OpenAI Sentinel PoW + IMAP XOAUTH2 取 OTP，直接走 OpenAI authorize 状态机。
 
