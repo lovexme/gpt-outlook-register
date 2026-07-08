@@ -15,9 +15,9 @@
 ## 📰 最近更新（2026-06）
 
 - 📱 **SMS 接码集成（解决 add-phone 拿不到 refresh_token 的问题）**
-  - 「📱 接码配置」Tab 一键启用：HeroSMS / SmsBower / SMS-Activate 三家平台
+  - 「📱 接码配置」Tab 一键启用SmsBower平台
   - 命中 `add-phone` 时自动租号 → 接 SMS → 验证，**全程无人值守**
-  - 支持 **号码复用**（HeroSMS / SmsBower：一个号注册多个 ChatGPT，省钱）
+  - 支持 **号码复用**（SmsBower：一个号注册多个 ChatGPT，省钱）
   - 支持 **自动选最优国家**（按价格 + 库存）
   - WebUI 提供「测试余额」「查询国家排名」按钮
   - 兼容旧的 `OPENAI_PHONE_NUMBER` / `OPENAI_PHONE_OTP` 环境变量路径（未启用接码时自动回退）
