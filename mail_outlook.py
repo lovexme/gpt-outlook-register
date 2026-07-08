@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -29,6 +30,25 @@ logger = logging.getLogger(__name__)
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 IMAP_HOST = "outlook.office365.com"
+
+
+class FatalOutlookMailError(RuntimeError):
+    """Non-retryable Outlook mail error."""
+
+
+_FATAL_IMAP_ERROR_PATTERNS = (
+    "user is authenticated but not connected",
+    "authentication failed",
+    "authenticate failed",
+    "imap xoauth2",
+    "invalid_grant",
+    "invalid_client",
+)
+
+
+def _is_fatal_imap_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(p in msg for p in _FATAL_IMAP_ERROR_PATTERNS)
 
 
 # ──────────────────────── Microsoft OAuth refresh_token → access_token ────────────────────────
@@ -42,10 +62,20 @@ def get_outlook_access_token(refresh_token: str, client_id: str) -> str:
         "scope": IMAP_SCOPE,
     }).encode()
     req = urllib.request.Request(GRAPH_TOKEN_URL, data=body)
-    resp = urllib.request.urlopen(req, timeout=15)
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(text or "{}")
+        except Exception:
+            data = {"error": text[:500]}
+        if e.code in (400, 401, 403):
+            raise FatalOutlookMailError(f"outlook refresh failed: {data}") from e
+        raise
     data = json.loads(resp.read())
     if not data.get("access_token"):
-        raise RuntimeError(f"outlook refresh failed: {data}")
+        raise FatalOutlookMailError(f"outlook refresh failed: {data}")
     return data
 
 
@@ -220,7 +250,13 @@ def fetch_otp_via_imap(
                 M.logout()
             except Exception:
                 pass
+        except FatalOutlookMailError:
+            raise
         except Exception as e:
+            if _is_fatal_imap_error(e):
+                raise FatalOutlookMailError(
+                    f"outlook IMAP account unusable for {email_addr}: {e}"
+                ) from e
             logger.warning(f"[outlook-imap] fetch_otp 异常 (吃掉重试): {e}")
         time.sleep(4)
     raise TimeoutError(f"outlook OTP timeout {timeout}s for {email_addr}")

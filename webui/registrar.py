@@ -96,6 +96,8 @@ def classify_error(err: str) -> str:
     # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
     if any(p in s for p in (
         "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
+        "outlook imap account unusable", "user is authenticated but not connected",
+        "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
     )):
@@ -264,7 +266,8 @@ def _do_register(
         err = str(e)
         category = classify_error(err)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
-        logging.getLogger("registrar").error(traceback.format_exc())
+        if category != "account":
+            logging.getLogger("registrar").error(traceback.format_exc())
         # CF 模式下不操作号池
         if mail_source != "cf_temp":
             if category == "network":
