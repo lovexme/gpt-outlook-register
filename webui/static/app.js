@@ -859,16 +859,19 @@ $("#btnTestMail").addEventListener("click", async (e) => {
 
 // ──────────────────────── 📱 SMS 接码配置 ────────────────────────
 
-// 全量国家列表（id → name_cn + openai_sms_safe）；首次加载配置时从后端拿
+// 全量国家列表（id → name_cn + openai_sms_safe）；按 provider 动态加载
 let _smsAllCountries = [];
 let _smsSafeCountrySet = new Set();
+let _smsCountriesProvider = "";
 
-async function _loadSmsAllCountries() {
-  if (_smsAllCountries.length) return _smsAllCountries;
+async function _loadSmsAllCountries(provider) {
+  provider = provider || "smsbower";
+  if (_smsAllCountries.length && _smsCountriesProvider === provider) return _smsAllCountries;
   try {
-    const r = await api("/api/settings/sms/all_countries");
+    const r = await api(`/api/settings/sms/all_countries?provider=${encodeURIComponent(provider)}`);
     _smsAllCountries = r.countries || [];
     _smsSafeCountrySet = new Set(r.openai_sms_safe || []);
+    _smsCountriesProvider = provider;
   } catch (e) {
     console.error("加载国家列表失败:", e);
   }
@@ -941,11 +944,11 @@ function _getAllowedCountriesValue() {
 }
 
 async function loadSmsConfig() {
-  await _loadSmsAllCountries();
   try {
     const { config } = await api("/api/settings/sms");
-    $("#smsEnabled").checked = config.sms_enabled === "1";
     const provider = config.sms_provider || "smsbower";
+    await _loadSmsAllCountries(provider);
+    $("#smsEnabled").checked = config.sms_enabled === "1";
     const radio = document.querySelector(`input[name="smsProvider"][value="${provider}"]`);
     if (radio) radio.checked = true;
     $("#smsApiKey").value = "";
@@ -967,6 +970,20 @@ async function loadSmsConfig() {
     console.error("loadSmsConfig:", e);
   }
 }
+
+// 切换接码平台时重新加载国家列表
+document.querySelectorAll("input[name='smsProvider']").forEach(radio => {
+  radio.addEventListener("change", async (e) => {
+    const newProvider = e.target.value;
+    _smsAllCountries = [];
+    _smsCountriesProvider = "";
+    const box = $("#smsAllowedCountriesBox");
+    if (box) box.innerHTML = '<em style="grid-column:1/-1;color:#aaa;font-size:12px">加载中...</em>';
+    await _loadSmsAllCountries(newProvider);
+    _renderSmsCountrySelect($("#smsCountry"), $("#smsCountry").value);
+    _renderSmsAllowedCountriesBox(_getAllowedCountriesValue());
+  });
+});
 
 $("#btnClearAllowedCountries")?.addEventListener("click", () => {
   $("#smsAllowedCountriesBox").querySelectorAll("input[type=checkbox]").forEach(cb => {

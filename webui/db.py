@@ -592,7 +592,7 @@ def get_sms_config() -> dict:
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
-        "sms_reuse_phone":         get_setting("sms_reuse_phone", "1"),
+        "sms_reuse_phone":         get_setting("sms_reuse_phone", "0"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0"),
         "sms_strict_whitelist":    get_setting("sms_strict_whitelist", "0"),
@@ -607,7 +607,7 @@ def get_sms_config() -> dict:
 def save_sms_config(data: dict) -> None:
     """保存 SMS 配置。sms_api_key 传 '***' 表示不修改。"""
     # 校验 provider
-    valid_providers = {"smsbower"}
+    valid_providers = {"smsbower", "herosms"}
     if "sms_provider" in data:
         p = str(data["sms_provider"]).strip().lower()
         if p not in valid_providers:
@@ -645,7 +645,7 @@ def get_sms_internal_config() -> dict:
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
         "sms_max_price":           get_setting("sms_max_price", ""),
-        "sms_reuse_phone":         get_setting("sms_reuse_phone", "1") in ("1", "true"),
+        "sms_reuse_phone":         get_setting("sms_reuse_phone", "0") in ("1", "true"),
         "sms_phone_success_max":   get_setting("sms_phone_success_max", "3"),
         "sms_auto_country":        get_setting("sms_auto_country", "0") in ("1", "true"),
         "sms_strict_whitelist":    get_setting("sms_strict_whitelist", "0") in ("1", "true"),

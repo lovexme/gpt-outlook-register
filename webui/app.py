@@ -330,7 +330,7 @@ def api_get_sms_config():
 
 class SaveSmsConfigReq(BaseModel):
     sms_enabled: Optional[str] = None              # "0" / "1"
-    sms_provider: Optional[str] = None             # smsbower / smsbower
+    sms_provider: Optional[str] = None             # smsbower / herosms
     sms_api_key: Optional[str] = None              # 传 '***' 表示不修改
     sms_country: Optional[str] = None              # ID 或国家代码（'52' / 'th'）
     sms_service: Optional[str] = None              # OpenAI = 'dr'
@@ -379,12 +379,10 @@ def api_test_sms():
 
 @app.get("/api/settings/sms/countries")
 def api_sms_top_countries():
-    """查询 SmsBower / SmsBower 的国家排名（价格 + 库存）。"""
+    """查询当前接码平台的国家排名（价格 + 库存）。"""
     cfg = db.get_sms_internal_config()
     if not cfg.get("sms_api_key"):
         raise HTTPException(400, "未配置 sms_api_key")
-    if cfg["sms_provider"] not in ("smsbower", "smsbower"):
-        return {"ok": True, "countries": [], "message": "当前 provider 不支持国家排名查询"}
 
     import sys as _sys
     ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -404,24 +402,47 @@ def api_sms_top_countries():
 
 
 @app.get("/api/settings/sms/all_countries")
-def api_sms_all_countries():
-    """返回所有已知国家 ID + 中文名（用于下拉框 / 多选）。"""
+def api_sms_all_countries(provider: str = ""):
+    """返回当前平台实际有库存的国家（动态查询）；查询失败则 fallback 到静态字典。"""
     import sys as _sys
     ROOT_DIR = Path(__file__).resolve().parents[1]
     if str(ROOT_DIR) not in _sys.path:
         _sys.path.insert(0, str(ROOT_DIR))
-    from sms_provider import SMS_COUNTRY_NAMES_CN, OPENAI_SMS_COUNTRIES
-    # 按 ID 数值升序
+    from sms_provider import SMS_COUNTRY_NAMES_CN, OPENAI_SMS_COUNTRIES, create_sms_provider
+
+    cfg = db.get_sms_internal_config()
+    if provider:
+        cfg["sms_provider"] = provider
+
+    # 尝试从平台 API 动态获取有库存的国家
+    if cfg.get("sms_api_key"):
+        try:
+            p = create_sms_provider(cfg["sms_provider"], cfg)
+            rows = p.get_top_countries(service=cfg.get("sms_service") or "dr")
+            countries = []
+            for r in rows:
+                cid = str(r.get("country") or "")
+                countries.append({
+                    "id": cid,
+                    "name_cn": SMS_COUNTRY_NAMES_CN.get(cid, f"国家{cid}"),
+                    "openai_sms_safe": cid in OPENAI_SMS_COUNTRIES,
+                    "price": r.get("price"),
+                    "count": r.get("count"),
+                })
+            if countries:
+                return {"ok": True, "countries": countries,
+                        "openai_sms_safe": list(OPENAI_SMS_COUNTRIES), "source": "live"}
+        except Exception:
+            pass
+
+    # fallback: 静态字典
     items = sorted(SMS_COUNTRY_NAMES_CN.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 9999)
     countries = [
-        {
-            "id": cid,
-            "name_cn": name,
-            "openai_sms_safe": cid in OPENAI_SMS_COUNTRIES,
-        }
+        {"id": cid, "name_cn": name, "openai_sms_safe": cid in OPENAI_SMS_COUNTRIES}
         for cid, name in items
     ]
-    return {"ok": True, "countries": countries, "openai_sms_safe": list(OPENAI_SMS_COUNTRIES)}
+    return {"ok": True, "countries": countries,
+            "openai_sms_safe": list(OPENAI_SMS_COUNTRIES), "source": "static"}
 
 
 # ──────────────────────── 自动导出 (CPA / SUB2API) ────────────────────────
