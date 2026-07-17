@@ -403,14 +403,31 @@ def save_registered(d: dict) -> None:
         con.commit()
 
 
-def list_registered(limit: int = 500) -> list[dict]:
+def count_registered(filter_rt: str = "all") -> int:
     con = _conn()
+    if filter_rt == "has_rt":
+        cur = con.execute("SELECT COUNT(*) FROM registered WHERE length(refresh_token) > 0")
+    elif filter_rt == "no_rt":
+        cur = con.execute("SELECT COUNT(*) FROM registered WHERE coalesce(length(refresh_token),0) = 0")
+    else:
+        cur = con.execute("SELECT COUNT(*) FROM registered")
+    return cur.fetchone()[0]
+
+
+def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
+    con = _conn()
+    if filter_rt == "has_rt":
+        where = "WHERE length(refresh_token) > 0"
+    elif filter_rt == "no_rt":
+        where = "WHERE coalesce(length(refresh_token),0) = 0"
+    else:
+        where = ""
     cur = con.execute(
-        "SELECT email, password, "
-        "length(access_token) AS at_len, length(session_token) AS st_len, "
-        "length(refresh_token) AS rt_len, created_at FROM registered "
-        "ORDER BY created_at DESC LIMIT ?",
-        (limit,),
+        f"SELECT email, password, "
+        f"length(access_token) AS at_len, length(session_token) AS st_len, "
+        f"length(refresh_token) AS rt_len, created_at FROM registered "
+        f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
     )
     return [dict(r) for r in cur.fetchall()]
 

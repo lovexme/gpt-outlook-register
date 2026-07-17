@@ -21,14 +21,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 通用 UA
+# 通用 UA（fallback，优先使用 fingerprint.generate_fingerprint() 生成的值）
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 )
 
 
-def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome136"):
+def create_http_session(
+    proxy: Optional[str] = None,
+    impersonate: str = "safari18_0",
+    user_agent: Optional[str] = None,
+):
     """
     创建 HTTP 会话。优先使用 curl_cffi 模拟浏览器 TLS 指纹，
     不可用时降级到 requests。
@@ -63,5 +67,5 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
         session.mount("http://", adapter)
         if proxy:
             session.proxies = {"https": proxy, "http": proxy}
-        session.headers["User-Agent"] = USER_AGENT
+        session.headers["User-Agent"] = user_agent or USER_AGENT
         return session

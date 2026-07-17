@@ -233,8 +233,10 @@ def api_runs(limit: int = 50):
 
 
 @app.get("/api/registered")
-def api_registered(limit: int = 500):
-    return {"ok": True, "items": db.list_registered(limit=limit)}
+def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
+    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
+    total = db.count_registered(filter_rt=filter)
+    return {"ok": True, "items": items, "total": total}
 
 
 @app.get("/api/registered/{email}")

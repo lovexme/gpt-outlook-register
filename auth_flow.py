@@ -21,6 +21,7 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from config import Config
+from fingerprint import generate_fingerprint
 from mail_outlook import OutlookMailProvider as MailProvider
 from http_client import create_http_session, USER_AGENT
 
@@ -63,11 +64,16 @@ class AuthFlow:
 
     def __init__(self, config: Config, sms_callback: Optional[Any] = None):
         self.config = config
-        self._impersonate_candidates = ["chrome136", "chrome124", "chrome120"]
+        self._fingerprint = generate_fingerprint()
+        self._ua = self._fingerprint["user_agent"]
+        self._impersonate_candidates = [
+            self._fingerprint["impersonate"], "safari17_0", "safari15_5",
+        ]
         self._impersonate_idx = 0
         self.session = create_http_session(
             proxy=config.proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],
+            user_agent=self._ua,
         )
         self.result = AuthResult()
         # 可选 SMS 接码控制器（sms_provider.PhoneCallbackController 实例）
@@ -96,6 +102,10 @@ class AuthFlow:
             "1", "true", "yes", "on"
         )
         self._trace_dump_path = ""
+        logger.info(
+            f"指纹: impersonate={self._fingerprint['impersonate']} "
+            f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']}"
+        )
 
     def _build_chatgpt_cookie_header(self) -> str:
         """
@@ -629,7 +639,7 @@ class AuthFlow:
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": "https://chatgpt.com/",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": self._ua,
                 },
                 timeout=30,
                 allow_redirects=False,
@@ -714,7 +724,7 @@ class AuthFlow:
             "Accept": "application/json",
             "Origin": "https://auth.openai.com",
             "Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            "User-Agent": USER_AGENT,
+            "User-Agent": self._ua,
         }
         form = {
             "grant_type": "authorization_code",
@@ -1425,7 +1435,9 @@ class AuthFlow:
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
         logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}")
-        self.session = create_http_session(proxy=self.config.proxy, impersonate=imp)
+        self.session = create_http_session(
+            proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
+        )
         return True
 
     @staticmethod
@@ -1470,12 +1482,18 @@ class AuthFlow:
         except Exception:
             pass
 
+        fp = self._fingerprint
         headers = {
             "Accept": "application/json",
             "Referer": referer,
             "Origin": origin,
-            "User-Agent": USER_AGENT,
+            "User-Agent": self._ua,
+            "Accept-Language": fp["lang_full"],
         }
+        if fp.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = fp["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+            headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
 
         # auth.openai.com 侧请求补设备标识（若可得）
         try:
@@ -1633,7 +1651,16 @@ class AuthFlow:
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
         from sentinel import get_sentinel_token
-        token = get_sentinel_token(self.session, device_id=device_id, flow="authorize_continue")
+        token = get_sentinel_token(
+            self.session,
+            device_id=device_id,
+            flow="authorize_continue",
+            user_agent=self._ua,
+            sec_ch_ua=self._fingerprint["sec_ch_ua"],
+            screen=self._fingerprint["screen"],
+            lang=self._fingerprint["lang"],
+            lang_full=self._fingerprint["lang_full"],
+        )
         self._last_sentinel_token = token or ""
         logger.info("Sentinel Token 获取成功")
         return token
@@ -2366,7 +2393,7 @@ class AuthFlow:
                     headers={
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Referer": "https://auth.openai.com/",
-                        "User-Agent": USER_AGENT,
+                        "User-Agent": self._ua,
                     },
                     timeout=30,
                     allow_redirects=False,

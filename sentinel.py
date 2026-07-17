@@ -56,9 +56,19 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str | None = None, user_agent: str | None = None):
+    def __init__(
+        self,
+        device_id: str | None = None,
+        user_agent: str | None = None,
+        screen: str = "",
+        lang: str = "",
+        lang_full: str = "",
+    ):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent or DEFAULT_UA
+        self.screen = screen or "1920x1080"
+        self.lang = lang or "en-US"
+        self.lang_full = lang_full or "en-US,en"
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
 
@@ -89,7 +99,7 @@ class SentinelTokenGenerator:
             "mediaDevices", "permissions", "locks", "ink",
         ])
         return [
-            "1920x1080",
+            self.screen,
             date_str,
             4294705152,
             random.random(),
@@ -97,8 +107,8 @@ class SentinelTokenGenerator:
             SENTINEL_SDK_URL,
             None,
             None,
-            "en-US",
-            "en-US,en",
+            self.lang,
+            self.lang_full,
             random.random(),
             f"{nav_prop}−undefined",
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
@@ -150,9 +160,15 @@ def fetch_sentinel_challenge(
     sec_ch_ua: str | None = None,
     impersonate: str | None = None,
     request_p: str | None = None,
+    screen: str = "",
+    lang: str = "",
+    lang_full: str = "",
 ) -> dict | None:
     """POST `/sentinel/req` 并返回响应 JSON。失败返回 None。"""
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    generator = SentinelTokenGenerator(
+        device_id=device_id, user_agent=user_agent,
+        screen=screen, lang=lang, lang_full=lang_full,
+    )
     req_body = {
         "p": str(request_p or "").strip() or generator.generate_requirements_token(),
         "id": device_id,
@@ -165,13 +181,14 @@ def fetch_sentinel_challenge(
         "Referer": SENTINEL_REFERER,
         "Origin": "https://sentinel.openai.com",
         "User-Agent": user_agent or DEFAULT_UA,
-        "sec-ch-ua": sec_ch_ua or DEFAULT_SEC_CH_UA,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     }
+    if sec_ch_ua:
+        headers["sec-ch-ua"] = sec_ch_ua
+        headers["sec-ch-ua-mobile"] = "?0"
+        headers["sec-ch-ua-platform"] = '"Windows"'
     kwargs = {"data": json.dumps(req_body), "headers": headers, "timeout": 20}
     if impersonate:
         kwargs["impersonate"] = impersonate
@@ -193,6 +210,9 @@ def build_sentinel_token(
     user_agent: str | None = None,
     sec_ch_ua: str | None = None,
     impersonate: str | None = None,
+    screen: str = "",
+    lang: str = "",
+    lang_full: str = "",
 ) -> str | None:
     """完整 Sentinel token：fetch challenge → 用 server-given seed/difficulty 解 PoW → 拼装。
 
@@ -205,6 +225,9 @@ def build_sentinel_token(
         user_agent=user_agent,
         sec_ch_ua=sec_ch_ua,
         impersonate=impersonate,
+        screen=screen,
+        lang=lang,
+        lang_full=lang_full,
     )
     if not challenge:
         return None
@@ -214,7 +237,10 @@ def build_sentinel_token(
         logger.warning("Sentinel 响应缺 token 字段")
         return None
 
-    generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    generator = SentinelTokenGenerator(
+        device_id=device_id, user_agent=user_agent,
+        screen=screen, lang=lang, lang_full=lang_full,
+    )
     pow_data = challenge.get("proofofwork") or {}
     if pow_data.get("required") and pow_data.get("seed"):
         p_value = generator.generate_token(
@@ -239,6 +265,10 @@ def get_sentinel_token(
     device_id: str,
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
+    sec_ch_ua: str = "",
+    screen: str = "",
+    lang: str = "",
+    lang_full: str = "",
 ) -> str:
     """auth_flow.py 复用的入口；返回 JSON 字符串，永远不抛异常。
 
@@ -274,6 +304,10 @@ def get_sentinel_token(
         device_id=device_id,
         flow=flow,
         user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        screen=screen,
+        lang=lang,
+        lang_full=lang_full,
     )
     if token:
         logger.info(f"Sentinel Token 组装完成 (纯 Python 长度: {len(token)})")
@@ -281,7 +315,8 @@ def get_sentinel_token(
 
     logger.warning("Sentinel /req 也失败，回退到无 challenge 模式")
     fallback_p = SentinelTokenGenerator(
-        device_id=device_id, user_agent=user_agent
+        device_id=device_id, user_agent=user_agent,
+        screen=screen, lang=lang, lang_full=lang_full,
     ).generate_requirements_token()
     return json.dumps({
         "p": fallback_p,

@@ -603,3 +603,24 @@ button.pay-copy.copied { background: #e2f0fb; color: var(--done); border-color: 
   max-height: 300px;
   overflow: auto;
 }
+
+/* 分页 */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px 0 4px;
+}
+.pagination button {
+  padding: 4px 14px;
+  font-size: 13px;
+}
+.pagination button:disabled {
+  opacity: .4;
+  cursor: default;
+}
+.pagination span {
+  font-size: 13px;
+  color: var(--dim);
+}

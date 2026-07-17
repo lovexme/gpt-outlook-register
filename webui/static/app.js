@@ -371,23 +371,32 @@ $("#poolTable").addEventListener("click", async (e) => {
   }
 });
 
-// ──────────────────────── 注册结果列表 ────────────────────────
+// ──────────────────────── 注册结果列表（分页） ────────────────────────
 
-async function refreshRegistered() {
-  const { items } = await api("/api/registered");
+const REG_PAGE_SIZE = 20;
+let _regPage = 1;
+let _regTotal = 0;
+
+function _regTotalPages() { return Math.max(1, Math.ceil(_regTotal / REG_PAGE_SIZE)); }
+
+function _updateRegPagination() {
+  const pages = _regTotalPages();
+  $("#regPageInfo").textContent = `第 ${_regPage} 页 / 共 ${pages} 页（${_regTotal} 条）`;
+  $("#regPrevPage").disabled = _regPage <= 1;
+  $("#regNextPage").disabled = _regPage >= pages;
+}
+
+async function refreshRegistered(resetPage) {
+  if (resetPage === true) _regPage = 1;
   const filter = document.querySelector("input[name='regFilter']:checked")?.value || "all";
-
-  // 按筛选条件过滤
-  let filtered = items;
-  if (filter === "has_rt") {
-    filtered = items.filter(r => r.rt_len > 0);
-  } else if (filter === "no_rt") {
-    filtered = items.filter(r => r.rt_len === 0);
-  }
+  const offset = (_regPage - 1) * REG_PAGE_SIZE;
+  const { items, total } = await api(`/api/registered?limit=${REG_PAGE_SIZE}&offset=${offset}&filter=${filter}`);
+  _regTotal = total;
+  if (_regPage > _regTotalPages()) _regPage = _regTotalPages();
 
   const tb = $("#regTable tbody");
   tb.innerHTML = "";
-  for (const r of filtered) {
+  for (const r of items) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><input type="checkbox" class="reg-check" data-email="${r.email}"></td>
@@ -405,12 +414,16 @@ async function refreshRegistered() {
   }
   $("#regSelectAll").checked = false;
   _updateSelCountReg();
+  _updateRegPagination();
 }
-$("#btnRefreshReg").addEventListener("click", refreshRegistered);
 
-// radio 切换时自动刷新
+$("#btnRefreshReg").addEventListener("click", () => refreshRegistered(false));
+$("#regPrevPage").addEventListener("click", () => { if (_regPage > 1) { _regPage--; refreshRegistered(); } });
+$("#regNextPage").addEventListener("click", () => { if (_regPage < _regTotalPages()) { _regPage++; refreshRegistered(); } });
+
+// radio 切换时重置到第一页
 document.querySelectorAll("input[name='regFilter']").forEach(r => {
-  r.addEventListener("change", refreshRegistered);
+  r.addEventListener("change", () => refreshRegistered(true));
 });
 
 // ── 注册结果：复选框 + 批量删 + 单行删 ──
