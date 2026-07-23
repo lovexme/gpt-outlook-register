@@ -140,17 +140,26 @@ def import_accounts(text: str) -> dict:
     return {"parsed": len(rows), "inserted": inserted, "updated": updated, "skipped": skipped}
 
 
-def list_accounts(status: str = "", limit: int = 500) -> list[dict]:
+def count_accounts(status: str = "") -> int:
+    con = _conn()
+    if status:
+        cur = con.execute("SELECT COUNT(*) FROM outlook_accounts WHERE status=?", (status,))
+    else:
+        cur = con.execute("SELECT COUNT(*) FROM outlook_accounts")
+    return cur.fetchone()[0]
+
+
+def list_accounts(status: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
     con = _conn()
     if status:
         cur = con.execute(
-            "SELECT * FROM outlook_accounts WHERE status=? ORDER BY imported_at DESC LIMIT ?",
-            (status, limit),
+            "SELECT * FROM outlook_accounts WHERE status=? ORDER BY imported_at DESC LIMIT ? OFFSET ?",
+            (status, limit, offset),
         )
     else:
         cur = con.execute(
-            "SELECT * FROM outlook_accounts ORDER BY imported_at DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM outlook_accounts ORDER BY imported_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
     return [dict(r) for r in cur.fetchall()]
 
@@ -403,6 +412,29 @@ def save_registered(d: dict) -> None:
         con.commit()
 
 
+def update_plus_check(email: str, plus_info: dict) -> None:
+    """把 Plus 检查结果写入 extra_json.plus_check。"""
+    email = email.lower()
+    con = _conn()
+    cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
+    row = cur.fetchone()
+    if not row:
+        return
+    extra = {}
+    if row["extra_json"]:
+        try:
+            extra = json.loads(row["extra_json"])
+        except Exception:
+            extra = {}
+    extra["plus_check"] = plus_info
+    with _lock:
+        con.execute(
+            "UPDATE registered SET extra_json=? WHERE email=?",
+            (json.dumps(extra, ensure_ascii=False), email),
+        )
+        con.commit()
+
+
 def count_registered(filter_rt: str = "all") -> int:
     con = _conn()
     if filter_rt == "has_rt":
@@ -425,11 +457,24 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
     cur = con.execute(
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
-        f"length(refresh_token) AS rt_len, created_at FROM registered "
+        f"length(refresh_token) AS rt_len, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (limit, offset),
     )
-    return [dict(r) for r in cur.fetchall()]
+    rows = []
+    for r in cur.fetchall():
+        d = dict(r)
+        plus = None
+        if d.get("extra_json"):
+            try:
+                extra = json.loads(d["extra_json"])
+                plus = extra.get("plus_check")
+            except Exception:
+                pass
+        d["plus_check"] = plus
+        d.pop("extra_json", None)
+        rows.append(d)
+    return rows
 
 
 def list_registered_full(limit: int = 5000) -> list[dict]:

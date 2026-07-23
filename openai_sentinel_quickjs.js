@@ -222,11 +222,11 @@ function installRuntime(payload) {
   globalThis.document = document;
   globalThis.navigator = {
     userAgent: String(payload.user_agent || "Mozilla/5.0"),
-    language: String(payload.language || "zh-CN"),
-    languages: Array.isArray(payload.languages) ? payload.languages : ["zh-CN", "zh"],
-    hardwareConcurrency: Number(payload.hardware_concurrency || 12),
-    platform: "Win32",
-    vendor: "Google Inc.",
+    language: String(payload.language || "en-US"),
+    languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
+    hardwareConcurrency: Number(payload.hardware_concurrency || 8),
+    platform: String(payload.platform || "MacIntel"),
+    vendor: String(payload.vendor || "Apple Computer, Inc."),
     webdriver: false,
   };
   globalThis.location = {

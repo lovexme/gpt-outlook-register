@@ -198,6 +198,10 @@ def get_sentinel_token_via_quickjs(
     flow: str = "authorize_continue",
     timeout_ms: int = 45000,
     log: Optional[Callable[[str], None]] = None,
+    user_agent: str = "",
+    screen: str = "",
+    lang: str = "",
+    lang_full: str = "",
 ) -> Optional[str]:
     """Try the QuickJS path. Return JSON string on success, None on any failure.
 
@@ -210,6 +214,31 @@ def get_sentinel_token_via_quickjs(
         return None
 
     did = str(device_id or uuid.uuid4())
+
+    screen_w, screen_h = "1920", "1080"
+    if screen and "x" in screen:
+        parts = screen.split("x", 1)
+        screen_w, screen_h = parts[0], parts[1]
+
+    lang_primary = lang or "en-US"
+    languages = [lang_primary]
+    if lang_full:
+        for part in lang_full.split(","):
+            tag = part.split(";")[0].strip()
+            if tag and tag not in languages:
+                languages.append(tag)
+
+    env_payload = {
+        "device_id": did,
+        "user_agent": user_agent or "Mozilla/5.0",
+        "screen_width": screen_w,
+        "screen_height": screen_h,
+        "language": lang_primary,
+        "languages": languages,
+        "platform": "MacIntel",
+        "vendor": "Apple Computer, Inc.",
+    }
+
     try:
         sdk_file = _ensure_sdk_file(session, timeout_ms)
 
@@ -217,7 +246,7 @@ def get_sentinel_token_via_quickjs(
             action="requirements",
             sdk_file=sdk_file,
             quickjs_script=quickjs_script,
-            payload={"device_id": did},
+            payload=env_payload,
             timeout_ms=timeout_ms,
         )
         request_p = str(requirements.get("request_p") or "").strip()
@@ -233,15 +262,16 @@ def get_sentinel_token_via_quickjs(
             log("Sentinel QuickJS 失败: challenge token 为空")
             return None
 
+        solve_payload = dict(env_payload)
+        solve_payload.update({
+            "request_p": request_p,
+            "challenge": challenge,
+        })
         solved = _run_quickjs_action(
             action="solve",
             sdk_file=sdk_file,
             quickjs_script=quickjs_script,
-            payload={
-                "device_id": did,
-                "request_p": request_p,
-                "challenge": challenge,
-            },
+            payload=solve_payload,
             timeout_ms=timeout_ms,
         )
         final_p = str(solved.get("final_p") or solved.get("p") or "").strip()

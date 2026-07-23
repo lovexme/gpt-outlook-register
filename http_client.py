@@ -23,7 +23,7 @@ from urllib3.util.retry import Retry
 
 # 通用 UA（fallback，优先使用 fingerprint.generate_fingerprint() 生成的值）
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 )
 

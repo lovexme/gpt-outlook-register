@@ -78,8 +78,10 @@ def api_import(req: ImportReq):
 
 
 @app.get("/api/accounts")
-def api_accounts(status: str = "", limit: int = 500):
-    return {"ok": True, "items": db.list_accounts(status=status, limit=limit)}
+def api_accounts(status: str = "", limit: int = 50, offset: int = 0):
+    items = db.list_accounts(status=status, limit=limit, offset=offset)
+    total = db.count_accounts(status=status)
+    return {"ok": True, "items": items, "total": total}
 
 
 @app.delete("/api/accounts/{email}")
@@ -535,6 +537,92 @@ def api_manual_export_to_panel(req: ManualExportReq):
             out["sub2api"] = {"ok": False, "error": str(e)}
 
     return {"ok": True, **out}
+
+
+# ──────────────────────── Plus 试用检查 ────────────────────────
+
+
+class CheckPlusReq(BaseModel):
+    emails: list[str] = Field(..., description="要检查的邮箱列表")
+    proxy: str = Field("", description="查询代理，留空直连")
+
+
+@app.post("/api/registered/check_plus")
+def api_check_plus(req: CheckPlusReq):
+    """用 access_token 查询账号的 Plus 试用状态。"""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        raise HTTPException(500, "curl_cffi 未安装")
+
+    results = {}
+    for email in req.emails:
+        cred = db.get_registered(email)
+        if not cred:
+            results[email] = {"status": "not_found", "label": "未找到"}
+            continue
+        at = (cred.get("access_token") or "").strip()
+        if not at:
+            results[email] = {"status": "no_at", "label": "无AT"}
+            continue
+        try:
+            proxies = None
+            proxy = req.proxy.strip()
+            if proxy:
+                proxies = {"https": proxy, "http": proxy}
+            resp = cffi_requests.get(
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                headers={
+                    "Authorization": f"Bearer {at}",
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/145.0.0.0 Safari/537.36"
+                    ),
+                },
+                proxies=proxies,
+                impersonate="chrome110",
+                timeout=15,
+            )
+            if resp.status_code == 401:
+                results[email] = {"status": "banned", "label": "封号"}
+                continue
+            if resp.status_code != 200:
+                results[email] = {"status": "error", "label": f"HTTP {resp.status_code}"}
+                continue
+            data = resp.json()
+            accts = data.get("accounts", {})
+            if not accts:
+                results[email] = {"status": "error", "label": "无账户数据"}
+                continue
+            info = next(iter(accts.values()))
+            acct = info.get("account", {})
+            ent = info.get("entitlement", {})
+            promo = info.get("eligible_promo_campaigns", {})
+            is_deactivated = acct.get("is_deactivated", False)
+            if is_deactivated:
+                results[email] = {"status": "banned", "label": "封号"}
+                continue
+            plan = acct.get("plan_type", "free")
+            has_sub = ent.get("has_active_subscription", False)
+            has_plus_promo = "plus" in promo and promo["plus"].get("id") == "plus-1-month-free"
+            if plan == "plus" or has_sub:
+                results[email] = {"status": "plus_active", "label": "Plus生效中"}
+            elif has_plus_promo:
+                results[email] = {"status": "plus_eligible", "label": "可领Plus试用"}
+            else:
+                results[email] = {"status": "free", "label": "Free"}
+        except Exception as e:
+            results[email] = {"status": "error", "label": str(e)[:60]}
+
+    import time as _time
+    checked_at = _time.time()
+    for email, info in results.items():
+        if info["status"] not in ("not_found", "no_at"):
+            db.update_plus_check(email, {**info, "checked_at": checked_at})
+
+    return {"ok": True, "results": results}
 
 
 # ──────────────────────── auto-loop ────────────────────────

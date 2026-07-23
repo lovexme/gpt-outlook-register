@@ -19,21 +19,25 @@ _SAFARI_VERSIONS = [
         "impersonate": "safari15_3",
         "safari_ver": "15.3",
         "webkit_ver": "605.1.15",
+        "macos_versions": ["10_15_7", "12_0", "12_1"],
     },
     {
         "impersonate": "safari15_5",
         "safari_ver": "15.5",
         "webkit_ver": "605.1.15",
+        "macos_versions": ["10_15_7", "12_4", "12_5"],
     },
     {
         "impersonate": "safari17_0",
         "safari_ver": "17.0",
         "webkit_ver": "605.1.15",
+        "macos_versions": ["13_6", "14_0", "14_1"],
     },
     {
         "impersonate": "safari18_0",
         "safari_ver": "18.0",
         "webkit_ver": "605.1.15",
+        "macos_versions": ["14_4", "14_5", "15_0", "15_1"],
     },
 ]
 
@@ -69,11 +73,12 @@ def generate_fingerprint(rng: random.Random | None = None) -> dict:
     r = rng or random
 
     safari = r.choice(_SAFARI_VERSIONS)
+    macos_ver = r.choice(safari["macos_versions"])
     screen = r.choice(_MAC_SCREENS)
     lang, lang_full = r.choice(_LANGUAGES)
 
     user_agent = (
-        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X {macos_ver}) "
         f"AppleWebKit/{safari['webkit_ver']} (KHTML, like Gecko) "
         f"Version/{safari['safari_ver']} Safari/{safari['webkit_ver']}"
     )
@@ -88,3 +93,19 @@ def generate_fingerprint(rng: random.Random | None = None) -> dict:
         "lang": lang,
         "lang_full": lang_full,
     }
+
+
+_IMPERSONATE_TO_SAFARI = {s["impersonate"]: s for s in _SAFARI_VERSIONS}
+
+
+def ua_for_impersonate(impersonate: str, current_ua: str) -> str:
+    """根据 impersonate 名生成匹配的 UA，保持 macOS 版本合理。"""
+    safari = _IMPERSONATE_TO_SAFARI.get(impersonate)
+    if not safari:
+        return current_ua
+    macos_ver = random.choice(safari["macos_versions"])
+    return (
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X {macos_ver}) "
+        f"AppleWebKit/{safari['webkit_ver']} (KHTML, like Gecko) "
+        f"Version/{safari['safari_ver']} Safari/{safari['webkit_ver']}"
+    )

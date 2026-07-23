@@ -77,7 +77,7 @@ $("#btnImport").addEventListener("click", async () => {
     $("#importResult").className = "result ok";
     $("#importText").value = "";
     refreshStats();
-    refreshPool();
+    refreshPool(true);
   } catch (e) {
     $("#importResult").textContent = "❌ " + e.message;
     $("#importResult").className = "result bad";
@@ -202,9 +202,26 @@ $$(".tab").forEach((t) => {
 
 // ──────────────────────── 号池列表 ────────────────────────
 
-async function refreshPool() {
+const POOL_PAGE_SIZE = 20;
+let _poolPage = 1;
+let _poolTotal = 0;
+
+function _poolTotalPages() { return Math.max(1, Math.ceil(_poolTotal / POOL_PAGE_SIZE)); }
+
+function _updatePoolPagination() {
+  const pages = _poolTotalPages();
+  $("#poolPageInfo").textContent = `第 ${_poolPage} 页 / 共 ${pages} 页（${_poolTotal} 条）`;
+  $("#poolPrevPage").disabled = _poolPage <= 1;
+  $("#poolNextPage").disabled = _poolPage >= pages;
+}
+
+async function refreshPool(resetPage) {
+  if (resetPage === true) _poolPage = 1;
   const status = $("#poolFilter").value;
-  const { items } = await api(`/api/accounts?status=${encodeURIComponent(status)}`);
+  const offset = (_poolPage - 1) * POOL_PAGE_SIZE;
+  const { items, total } = await api(`/api/accounts?status=${encodeURIComponent(status)}&limit=${POOL_PAGE_SIZE}&offset=${offset}`);
+  _poolTotal = total;
+  if (_poolPage > _poolTotalPages()) _poolPage = _poolTotalPages();
   const tb = $("#poolTable tbody");
   tb.innerHTML = "";
   for (const r of items) {
@@ -225,9 +242,12 @@ async function refreshPool() {
   }
   $("#poolSelectAll").checked = false;
   _updateSelCount();
+  _updatePoolPagination();
 }
-$("#btnRefreshPool").addEventListener("click", refreshPool);
-$("#poolFilter").addEventListener("change", refreshPool);
+$("#btnRefreshPool").addEventListener("click", () => refreshPool(false));
+$("#poolPrevPage").addEventListener("click", () => { if (_poolPage > 1) { _poolPage--; refreshPool(); } });
+$("#poolNextPage").addEventListener("click", () => { if (_poolPage < _poolTotalPages()) { _poolPage++; refreshPool(); } });
+$("#poolFilter").addEventListener("change", () => refreshPool(true));
 
 $("#btnResetFailed").addEventListener("click", async () => {
   if (!confirm("把所有 failed 号重置为 available？")) return;
@@ -373,6 +393,8 @@ $("#poolTable").addEventListener("click", async (e) => {
 
 // ──────────────────────── 注册结果列表（分页） ────────────────────────
 
+const _plusCache = {};
+
 const REG_PAGE_SIZE = 20;
 let _regPage = 1;
 let _regTotal = 0;
@@ -398,9 +420,14 @@ async function refreshRegistered(resetPage) {
   tb.innerHTML = "";
   for (const r of items) {
     const tr = document.createElement("tr");
+    const cached = _plusCache[r.email] || r.plus_check;
+    const plusCell = cached
+      ? `<span class="plus-status plus-${cached.status}">${cached.label}</span>`
+      : `<span class="plus-status plus-unknown">—</span>`;
     tr.innerHTML = `
       <td><input type="checkbox" class="reg-check" data-email="${r.email}"></td>
       <td>${r.email}</td>
+      <td data-plus-email="${r.email}">${plusCell}</td>
       <td>${r.at_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="access_token" title="点击复制 access_token">✅ ${r.at_len} 📋</button>` : "—"}</td>
       <td>${r.st_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="session_token" title="点击复制 session_token">✅ ${r.st_len} 📋</button>` : "—"}</td>
       <td>${r.rt_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="refresh_token" title="点击复制 refresh_token">✅ ${r.rt_len} 📋</button>` : "—"}</td>
@@ -424,6 +451,39 @@ $("#regNextPage").addEventListener("click", () => { if (_regPage < _regTotalPage
 // radio 切换时重置到第一页
 document.querySelectorAll("input[name='regFilter']").forEach(r => {
   r.addEventListener("change", () => refreshRegistered(true));
+});
+
+// ── Plus 试用检查 ──
+
+$("#btnCheckPlus").addEventListener("click", async () => {
+  const emails = Array.from(document.querySelectorAll("[data-plus-email]")).map(td => td.dataset.plusEmail);
+  if (!emails.length) { $("#checkPlusResult").textContent = "当前页无数据"; return; }
+  const proxy = $("#regProxy").value.trim();
+  $("#btnCheckPlus").disabled = true;
+  $("#checkPlusResult").textContent = `检查中... (${emails.length} 个号)`;
+  try {
+    const { results } = await api("/api/registered/check_plus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ emails, proxy }),
+    });
+    let plusCount = 0, freeCount = 0, bannedCount = 0;
+    for (const [email, info] of Object.entries(results)) {
+      _plusCache[email] = info;
+      const td = document.querySelector(`[data-plus-email="${email}"]`);
+      if (td) td.innerHTML = `<span class="plus-status plus-${info.status}">${info.label}</span>`;
+      if (info.status === "plus_eligible" || info.status === "plus_active") plusCount++;
+      else if (info.status === "banned") bannedCount++;
+      else freeCount++;
+    }
+    $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
+    $("#checkPlusResult").className = "result ok";
+  } catch (e) {
+    $("#checkPlusResult").textContent = "检查失败: " + e.message;
+    $("#checkPlusResult").className = "result bad";
+  } finally {
+    $("#btnCheckPlus").disabled = false;
+  }
 });
 
 // ── 注册结果：复选框 + 批量删 + 单行删 ──

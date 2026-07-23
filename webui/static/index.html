@@ -48,7 +48,7 @@
       <label>邮箱 <small>(留空 = 自动 claim 下一个 available)</small>
         <input id="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱">
       </label>
-      <label>代理 <small>(直连留空)</small>
+      <label>代理 <small>(直连留空，Plus检查复用此代理)</small>
         <input id="regProxy" placeholder="socks5://user:pass@host:1080">
       </label>
       <label>OTP 等待秒数
@@ -133,6 +133,11 @@
         </tr></thead>
         <tbody></tbody>
       </table>
+      <div id="poolPagination" class="pagination">
+        <button id="poolPrevPage" title="上一页">◀ 上一页</button>
+        <span id="poolPageInfo">第 1 页 / 共 1 页（0 条）</span>
+        <button id="poolNextPage" title="下一页">下一页 ▶</button>
+      </div>
     </div>
 
     <div class="tab-content hidden" id="tab-registered">
@@ -149,12 +154,14 @@
         </label>
         <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
         <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
+        <button id="btnCheckPlus" title="检查当前页所有号的 Plus 试用状态（使用上方代理）">🔍 检查Plus</button>
+        <span id="checkPlusResult" class="result"></span>
         <span id="exportResult" class="result"></span>
       </div>
       <table id="regTable">
         <thead><tr>
           <th><input type="checkbox" id="regSelectAll" title="全选/全不选"></th>
-          <th>邮箱</th><th>access_token</th><th>session_token</th><th>refresh_token</th><th>时间</th><th>操作</th>
+          <th>邮箱</th><th>Plus状态</th><th>access_token</th><th>session_token</th><th>refresh_token</th><th>时间</th><th>操作</th>
         </tr></thead>
         <tbody></tbody>
       </table>

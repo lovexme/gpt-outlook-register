@@ -92,11 +92,10 @@ class SentinelTokenGenerator:
         time_origin = time.time() * 1000 - perf_now
         nav_prop = random.choice([
             "vendorSub", "productSub", "vendor", "maxTouchPoints",
-            "scheduling", "userActivation", "doNotTrack", "geolocation",
-            "connection", "plugins", "mimeTypes", "pdfViewerEnabled",
-            "webkitTemporaryStorage", "webkitPersistentStorage",
+            "userActivation", "doNotTrack", "geolocation",
+            "plugins", "mimeTypes", "pdfViewerEnabled",
             "hardwareConcurrency", "cookieEnabled", "credentials",
-            "mediaDevices", "permissions", "locks", "ink",
+            "mediaDevices", "permissions", "locks",
         ])
         return [
             self.screen,
@@ -291,6 +290,10 @@ def get_sentinel_token(
                 device_id=device_id,
                 flow=flow,
                 log=lambda m: logger.info(m),
+                user_agent=user_agent,
+                screen=screen,
+                lang=lang,
+                lang_full=lang_full,
             )
             if qtoken:
                 logger.info(f"Sentinel Token 组装完成 (QuickJS 长度: {len(qtoken)})")

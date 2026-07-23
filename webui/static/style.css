@@ -253,6 +253,23 @@ td .status {
 .status.failed   { background: #fce4e4; color: var(--bad); }
 .status.running  { background: #fff4e1; color: var(--warn); }
 
+.plus-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.plus-unknown    { background: #f0f0f0; color: #999; }
+.plus-plus_eligible { background: #e6f5ea; color: #2e7d32; }
+.plus-plus_active   { background: #c8e6ff; color: #1565c0; }
+.plus-free       { background: #fff4e1; color: #e65100; }
+.plus-banned     { background: #fce4e4; color: #c62828; }
+.plus-error      { background: #fce4e4; color: #c62828; }
+.plus-no_at      { background: #f0f0f0; color: #999; }
+.plus-not_found  { background: #f0f0f0; color: #999; }
+
 td button { padding: 3px 8px; font-size: 11px; margin-right: 4px; }
 
 /* 模态框 */

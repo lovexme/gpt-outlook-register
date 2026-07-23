@@ -21,7 +21,7 @@ from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from config import Config
-from fingerprint import generate_fingerprint
+from fingerprint import generate_fingerprint, ua_for_impersonate
 from mail_outlook import OutlookMailProvider as MailProvider
 from http_client import create_http_session, USER_AGENT
 
@@ -104,7 +104,8 @@ class AuthFlow:
         self._trace_dump_path = ""
         logger.info(
             f"指纹: impersonate={self._fingerprint['impersonate']} "
-            f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']}"
+            f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']} "
+            f"ua={self._ua}"
         )
 
     def _build_chatgpt_cookie_header(self) -> str:
@@ -1429,12 +1430,13 @@ class AuthFlow:
         return out
 
     def _rotate_impersonate_session(self) -> bool:
-        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试。"""
+        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。"""
         if self._impersonate_idx >= len(self._impersonate_candidates) - 1:
             return False
         self._impersonate_idx += 1
         imp = self._impersonate_candidates[self._impersonate_idx]
-        logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}")
+        self._ua = ua_for_impersonate(imp, self._ua)
+        logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}, ua={self._ua[:60]}...")
         self.session = create_http_session(
             proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
         )
