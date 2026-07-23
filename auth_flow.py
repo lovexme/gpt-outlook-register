@@ -66,9 +66,10 @@ class AuthFlow:
         self.config = config
         self._fingerprint = generate_fingerprint()
         self._ua = self._fingerprint["user_agent"]
-        self._impersonate_candidates = [
-            self._fingerprint["impersonate"], "safari17_0", "safari15_5",
-        ]
+        self._impersonate_candidates = self._fingerprint.get(
+            "fallback_impersonates",
+            [self._fingerprint["impersonate"], "safari17_0", "safari15_5"],
+        )
         self._impersonate_idx = 0
         self.session = create_http_session(
             proxy=config.proxy,
@@ -102,7 +103,7 @@ class AuthFlow:
             "1", "true", "yes", "on"
         )
         self._trace_dump_path = ""
-        logger.info(
+        logger.debug(
             f"指纹: impersonate={self._fingerprint['impersonate']} "
             f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']} "
             f"ua={self._ua}"
@@ -447,7 +448,7 @@ class AuthFlow:
         if idt:
             self.result.id_token = idt
 
-        logger.info(
+        logger.debug(
             "client_auth_session_dump(%s) 成功: top_keys=%s cas_keys=%s session_id=%s refresh=%s verifier=%s",
             stage or "default",
             list(data.keys())[:12],
@@ -1229,7 +1230,7 @@ class AuthFlow:
         """
         allow_retry = self._env_flag("OAUTH_CODEX_RT_ALLOW_RETRY", "0")
         if self._codex_rt_attempted and (not allow_retry):
-            logger.info("Codex RT 本轮已尝试过，跳过重复尝试（可用 OAUTH_CODEX_RT_ALLOW_RETRY=1 强制重试）")
+            logger.debug("Codex RT 本轮已尝试过，跳过重复尝试")
             return False
         self._codex_rt_attempted = True
 
@@ -1314,7 +1315,7 @@ class AuthFlow:
                     )
 
             if not callback_url:
-                logger.warning("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
+                logger.debug("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
                 return False
             return self._exchange_codex_callback_code(
                 callback_url=callback_url,
@@ -1491,6 +1492,10 @@ class AuthFlow:
             "Origin": origin,
             "User-Agent": self._ua,
             "Accept-Language": fp["lang_full"],
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         if fp.get("sec_ch_ua"):
             headers["sec-ch-ua"] = fp["sec_ch_ua"]
@@ -1576,7 +1581,7 @@ class AuthFlow:
         if not csrf:
             raise RuntimeError("CSRF Token 获取失败")
         self.result.csrf_token = csrf
-        logger.info(f"CSRF Token: {csrf[:20]}...")
+        logger.debug(f"CSRF Token: {csrf[:20]}...")
         return csrf
 
     # ── Step 3: 获取 auth URL ──
@@ -1603,7 +1608,7 @@ class AuthFlow:
         self._remember_oauth_params(auth_url)
         auth_url = self._inject_pkce_into_auth_url(auth_url)
         self._remember_oauth_params(auth_url)
-        logger.info(f"Auth URL: {auth_url[:80]}...")
+        logger.debug(f"Auth URL: {auth_url[:80]}...")
         return auth_url
 
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
@@ -1646,7 +1651,7 @@ class AuthFlow:
             logger.warning(f"未从响应中获取 device_id，使用生成值: {device_id}")
 
         self.result.device_id = device_id
-        logger.info(f"Device ID: {device_id}")
+        logger.debug(f"Device ID: {device_id}")
         return device_id
 
     # ── Step 5: 获取 Sentinel Token ──
@@ -1659,12 +1664,14 @@ class AuthFlow:
             flow="authorize_continue",
             user_agent=self._ua,
             sec_ch_ua=self._fingerprint["sec_ch_ua"],
+            sec_ch_ua_platform=self._fingerprint.get("sec_ch_ua_platform", ""),
+            sec_ch_ua_mobile=self._fingerprint.get("sec_ch_ua_mobile", ""),
             screen=self._fingerprint["screen"],
             lang=self._fingerprint["lang"],
             lang_full=self._fingerprint["lang_full"],
         )
         self._last_sentinel_token = token or ""
-        logger.info("Sentinel Token 获取成功")
+        logger.debug("Sentinel Token 获取成功")
         return token
 
     # ── Step 6: 提交注册邮箱 ──
@@ -1788,7 +1795,7 @@ class AuthFlow:
                 token = _get_st(self.session, device_id=self.result.device_id,
                                 flow="username_password_create")
                 self._last_sentinel_token = token or ""
-                logger.info("Sentinel Token 获取成功")
+                logger.debug("Sentinel Token 获取成功")
             except Exception as e:
                 logger.warning(f"注册前刷新 sentinel 失败: {e}")
 
@@ -1972,7 +1979,7 @@ class AuthFlow:
                 token = _get_st(self.session, device_id=self.result.device_id,
                                 flow="create_account")
                 self._last_sentinel_token = token or ""
-                logger.info("Sentinel Token 获取成功")
+                logger.debug("Sentinel Token 获取成功")
             except Exception as e:
                 logger.warning(f"创建账户前刷新 sentinel 失败: {e}")
         headers = self._common_headers("https://auth.openai.com/about-you")
@@ -2068,7 +2075,7 @@ class AuthFlow:
             logger.warning("/choose-an-account HTML 里没找到 us_* session id, 跳过")
             return ""
         session_id = m.group(0)
-        logger.info(f"/choose-an-account 选 session_id={session_id}")
+        logger.debug(f"/choose-an-account 选 session_id={session_id}")
         headers = self._common_headers("https://auth.openai.com/choose-an-account")
         headers["Origin"] = "https://auth.openai.com"
 
@@ -2122,11 +2129,11 @@ class AuthFlow:
                     if not next_url and loc:
                         next_url = loc
                     if next_url:
-                        logger.info(f"choose-an-account 选号成功 endpoint={url} next={next_url[:120]}")
+                        logger.debug(f"choose-an-account 选号成功 endpoint={url} next={next_url[:120]}")
                         return next_url
                     # 200 但没 continue_url：可能 set 了 cookie，直接让 caller 重 GET authorize
                     if status == 200:
-                        logger.info(f"choose-an-account POST {url} 200 OK 无 continue_url，假定 cookie 已 set")
+                        logger.debug(f"choose-an-account POST {url} 200 OK 无 continue_url，假定 cookie 已 set")
                         return current_url  # 让外层重 GET 一次，cookie 已被 server set
             except Exception as e:
                 print(f"[choose-an-account] {method} {url} [{kind}] -> EXC {e}", flush=True)
@@ -2336,7 +2343,10 @@ class AuthFlow:
           3. 兼容大小写 / 下划线变体
         access_token 取 JSON 响应里的 `accessToken`。
         """
-        logger.info("[10/10] 获取认证 Session...")
+        first_call = not getattr(self, "_auth_session_fetched", False)
+        self._auth_session_fetched = True
+        if first_call:
+            logger.info("[10/10] 获取认证 Session...")
         headers = self._common_headers("https://chatgpt.com/")
         resp = self.session.get(
             "https://chatgpt.com/api/auth/session",
@@ -2368,13 +2378,8 @@ class AuthFlow:
             self.result.access_token = access_token
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
-        logger.info(
-            f"session_token: cookie={'有(len=%d)' % len(cookie_st) if cookie_st else '无'} "
-            f"json={'有(len=%d)' % len(json_st) if json_st else '无'} "
-            f"→ 最终={'有(len=%d)' % len(session_token) if session_token else '无'}; "
-            f"access_token={'有(len=%d)' % len(access_token) if access_token else '无'}; "
-            f"json_keys={list(sess_json.keys())[:10]}"
-        )
+        _log = logger.info if first_call else logger.debug
+        _log(f"session: st={'有' if session_token else '无'} at={'有' if access_token else '无'}")
         return session_token, access_token
 
     def _consume_callback_for_session(self, callback_url: str) -> bool:
@@ -2757,10 +2762,10 @@ class AuthFlow:
                 else:
                     # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
                     # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
-                    forced_resend = self._env_flag("OTP_FORCE_RESEND", "1")
+                    forced_resend = self._env_flag("OTP_FORCE_RESEND", "0")
                     if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
                         otp_sent_at = time.time()
-                        logger.info(f"已有账号验证码模式={mode}，已主动 resend OTP")
+                        logger.debug(f"已有账号验证码模式={mode}，已主动 resend OTP")
                     else:
                         # 回看短窗口，避免误读上一轮旧验证码
                         otp_sent_at = time.time() - 8
@@ -2880,7 +2885,7 @@ class AuthFlow:
         #       cookie（含 session-token），然后再 get_auth_session 拿 access_token；
         #       Codex RT exchange 用独立 authorize 链路，跟 chatgpt callback 不冲突。
         if (not refresh_only_mode) and callback_url:
-            logger.info("消费 callback 触发 NextAuth Set-Cookie (session-token) ...")
+            logger.debug("消费 callback 触发 NextAuth Set-Cookie (session-token)")
             self._consume_callback_for_session(callback_url)
 
         if not refresh_only_mode:

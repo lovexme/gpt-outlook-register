@@ -290,7 +290,7 @@ def get_sentinel_token_via_quickjs(
             separators=(",", ":"),
             ensure_ascii=False,
         )
-        log(f"Sentinel QuickJS 成功 (p_len={len(final_p)} t_len={len(t_value)} c_len={len(c_value)})")
+        log(f"Sentinel QuickJS OK (len={len(token)})")
         return token
     except Exception as e:
         log(f"Sentinel QuickJS 异常: {e}")

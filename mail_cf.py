@@ -198,7 +198,7 @@ class CFTempEmailProvider:
         resp = self._request("POST", "/admin/new_address", json=payload, timeout=15)
         status = getattr(resp, "status_code", 0)
         text = (getattr(resp, "text", "") or "")[:300]
-        logger.info(f"[cf_temp] new_address status={status} resp={text}")
+        logger.debug(f"[cf_temp] new_address status={status} resp={text}")
 
         if status != 200:
             raise RuntimeError(

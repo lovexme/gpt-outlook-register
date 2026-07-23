@@ -157,6 +157,8 @@ def fetch_sentinel_challenge(
     flow: str = "authorize_continue",
     user_agent: str | None = None,
     sec_ch_ua: str | None = None,
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
     impersonate: str | None = None,
     request_p: str | None = None,
     screen: str = "",
@@ -186,8 +188,8 @@ def fetch_sentinel_challenge(
     }
     if sec_ch_ua:
         headers["sec-ch-ua"] = sec_ch_ua
-        headers["sec-ch-ua-mobile"] = "?0"
-        headers["sec-ch-ua-platform"] = '"Windows"'
+        headers["sec-ch-ua-mobile"] = sec_ch_ua_mobile or "?0"
+        headers["sec-ch-ua-platform"] = sec_ch_ua_platform or '"Windows"'
     kwargs = {"data": json.dumps(req_body), "headers": headers, "timeout": 20}
     if impersonate:
         kwargs["impersonate"] = impersonate
@@ -208,6 +210,8 @@ def build_sentinel_token(
     flow: str = "authorize_continue",
     user_agent: str | None = None,
     sec_ch_ua: str | None = None,
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
     impersonate: str | None = None,
     screen: str = "",
     lang: str = "",
@@ -223,6 +227,8 @@ def build_sentinel_token(
         flow=flow,
         user_agent=user_agent,
         sec_ch_ua=sec_ch_ua,
+        sec_ch_ua_platform=sec_ch_ua_platform,
+        sec_ch_ua_mobile=sec_ch_ua_mobile,
         impersonate=impersonate,
         screen=screen,
         lang=lang,
@@ -265,6 +271,8 @@ def get_sentinel_token(
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
     sec_ch_ua: str = "",
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
@@ -296,7 +304,6 @@ def get_sentinel_token(
                 lang_full=lang_full,
             )
             if qtoken:
-                logger.info(f"Sentinel Token 组装完成 (QuickJS 长度: {len(qtoken)})")
                 return qtoken
             logger.warning("Sentinel QuickJS 失败，回退到纯 Python")
         except Exception as e:
@@ -308,12 +315,14 @@ def get_sentinel_token(
         flow=flow,
         user_agent=user_agent,
         sec_ch_ua=sec_ch_ua,
+        sec_ch_ua_platform=sec_ch_ua_platform,
+        sec_ch_ua_mobile=sec_ch_ua_mobile,
         screen=screen,
         lang=lang,
         lang_full=lang_full,
     )
     if token:
-        logger.info(f"Sentinel Token 组装完成 (纯 Python 长度: {len(token)})")
+        logger.debug(f"Sentinel Token (纯Python len={len(token)})")
         return token
 
     logger.warning("Sentinel /req 也失败，回退到无 challenge 模式")
