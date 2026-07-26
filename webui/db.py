@@ -435,25 +435,31 @@ def update_plus_check(email: str, plus_info: dict) -> None:
         con.commit()
 
 
+def _registered_where(filt: str) -> str:
+    if filt == "has_rt":
+        return "WHERE length(refresh_token) > 0"
+    if filt == "no_rt":
+        return "WHERE coalesce(length(refresh_token),0) = 0"
+    if filt == "unchecked":
+        return "WHERE (extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')"
+    if filt == "free":
+        return "WHERE extra_json LIKE '%\"free\"%'"
+    if filt == "plus":
+        return "WHERE (extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')"
+    if filt == "banned":
+        return "WHERE extra_json LIKE '%\"banned\"%'"
+    return ""
+
+
 def count_registered(filter_rt: str = "all") -> int:
     con = _conn()
-    if filter_rt == "has_rt":
-        cur = con.execute("SELECT COUNT(*) FROM registered WHERE length(refresh_token) > 0")
-    elif filter_rt == "no_rt":
-        cur = con.execute("SELECT COUNT(*) FROM registered WHERE coalesce(length(refresh_token),0) = 0")
-    else:
-        cur = con.execute("SELECT COUNT(*) FROM registered")
+    cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt)}")
     return cur.fetchone()[0]
 
 
 def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
     con = _conn()
-    if filter_rt == "has_rt":
-        where = "WHERE length(refresh_token) > 0"
-    elif filter_rt == "no_rt":
-        where = "WHERE coalesce(length(refresh_token),0) = 0"
-    else:
-        where = ""
+    where = _registered_where(filter_rt)
     cur = con.execute(
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "

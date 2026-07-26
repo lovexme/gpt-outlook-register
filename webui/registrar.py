@@ -87,6 +87,7 @@ _NETWORK_ERROR_PATTERNS = [
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
     "remote disconnected", "connection reset", "connection aborted",
     "max retries exceeded",
+    "invalid_state",
 ]
 
 

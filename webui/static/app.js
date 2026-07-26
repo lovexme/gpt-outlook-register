@@ -410,7 +410,7 @@ function _updateRegPagination() {
 
 async function refreshRegistered(resetPage) {
   if (resetPage === true) _regPage = 1;
-  const filter = document.querySelector("input[name='regFilter']:checked")?.value || "all";
+  const filter = $("#regFilter").value || "all";
   const offset = (_regPage - 1) * REG_PAGE_SIZE;
   const { items, total } = await api(`/api/registered?limit=${REG_PAGE_SIZE}&offset=${offset}&filter=${filter}`);
   _regTotal = total;
@@ -448,18 +448,32 @@ $("#btnRefreshReg").addEventListener("click", () => refreshRegistered(false));
 $("#regPrevPage").addEventListener("click", () => { if (_regPage > 1) { _regPage--; refreshRegistered(); } });
 $("#regNextPage").addEventListener("click", () => { if (_regPage < _regTotalPages()) { _regPage++; refreshRegistered(); } });
 
-// radio 切换时重置到第一页
-document.querySelectorAll("input[name='regFilter']").forEach(r => {
-  r.addEventListener("change", () => refreshRegistered(true));
-});
+// 筛选切换时重置到第一页
+$("#regFilter").addEventListener("change", () => refreshRegistered(true));
 
 // ── Plus 试用检查 ──
 
-$("#btnCheckPlus").addEventListener("click", async () => {
-  const emails = Array.from(document.querySelectorAll("[data-plus-email]")).map(td => td.dataset.plusEmail);
-  if (!emails.length) { $("#checkPlusResult").textContent = "当前页无数据"; return; }
+function _collectPlusEmails(uncheckedOnly) {
+  const tds = Array.from(document.querySelectorAll("[data-plus-email]"));
+  if (!uncheckedOnly) return tds.map(td => td.dataset.plusEmail);
+  return tds
+    .filter(td => {
+      const span = td.querySelector(".plus-status");
+      return !span || span.classList.contains("plus-unknown");
+    })
+    .map(td => td.dataset.plusEmail);
+}
+
+async function _doCheckPlus(uncheckedOnly) {
+  const emails = _collectPlusEmails(uncheckedOnly);
+  if (!emails.length) {
+    $("#checkPlusResult").textContent = uncheckedOnly ? "当前页没有未检测的号" : "当前页无数据";
+    $("#checkPlusResult").className = "result";
+    return;
+  }
   const proxy = $("#regProxy").value.trim();
   $("#btnCheckPlus").disabled = true;
+  $("#btnRecheckPlus").disabled = true;
   $("#checkPlusResult").textContent = `检查中... (${emails.length} 个号)`;
   try {
     const { results } = await api("/api/registered/check_plus", {
@@ -483,8 +497,12 @@ $("#btnCheckPlus").addEventListener("click", async () => {
     $("#checkPlusResult").className = "result bad";
   } finally {
     $("#btnCheckPlus").disabled = false;
+    $("#btnRecheckPlus").disabled = false;
   }
-});
+}
+
+$("#btnCheckPlus").addEventListener("click", () => _doCheckPlus(true));
+$("#btnRecheckPlus").addEventListener("click", () => _doCheckPlus(false));
 
 // ── 注册结果：复选框 + 批量删 + 单行删 ──
 
