@@ -59,7 +59,7 @@ class RegisterReq(BaseModel):
     want_session_token: bool = True
     want_refresh_token: bool = True
     proxy: str = ""
-    otp_timeout: int = 180
+    otp_timeout: int = 10
     allow_existing_login: bool = True
 
 
@@ -589,12 +589,12 @@ def api_check_plus(req: CheckPlusReq):
                 results[email] = {"status": "banned", "label": "封号"}
                 continue
             if resp.status_code != 200:
-                results[email] = {"status": "error", "label": f"HTTP {resp.status_code}"}
+                # HTTP 非 200/401 不记录，让前端继续显示"未检测"
                 continue
             data = resp.json()
             accts = data.get("accounts", {})
             if not accts:
-                results[email] = {"status": "error", "label": "无账户数据"}
+                # 无账户数据不记录，让前端继续显示"未检测"
                 continue
             info = next(iter(accts.values()))
             acct = info.get("account", {})
@@ -614,7 +614,8 @@ def api_check_plus(req: CheckPlusReq):
             else:
                 results[email] = {"status": "free", "label": "Free"}
         except Exception as e:
-            results[email] = {"status": "error", "label": str(e)[:60]}
+            # 所有异常（包括 curl 网络错误）都不记录，让前端继续显示"未检测"
+            pass
 
     import time as _time
     checked_at = _time.time()
@@ -636,9 +637,10 @@ class AutoLoopStartReq(BaseModel):
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
     proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
     concurrency: int = 1         # 并发 worker 数（1-20）
-    otp_timeout: int = 180
+    otp_timeout: int = 10
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
+    target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）
 
 
 @app.post("/api/auto/start")

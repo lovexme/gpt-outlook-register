@@ -202,10 +202,28 @@ def get_sentinel_token_via_quickjs(
     screen: str = "",
     lang: str = "",
     lang_full: str = "",
+    browser_type: str = "",
+    platform: str = "",
+    vendor: Optional[str] = None,
+    hardware_concurrency: int = 0,
+    device_memory: Optional[int] = None,
+    max_touch_points: int = 0,
+    device_pixel_ratio: float = 0.0,
+    timezone: str = "",  # IANA 时区名（如 Asia/Tokyo）
+    # Client Hints 全套（QuickJS 路径不直接用，但为了签名统一接收）
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: str = "",
+    sec_ch_ua_platform_version: str = "",
 ) -> Optional[str]:
     """Try the QuickJS path. Return JSON string on success, None on any failure.
 
     Caller is expected to fall back to pure-Python sentinel on None.
+
+    指纹一致性：``platform`` / ``vendor`` / ``hardware_concurrency`` 等按调用方
+    传入的浏览器家族画像喂给 sdk.js 的 navigator，避免 UA 说 Windows Chrome 但
+    navigator 报 MacIntel/Apple 的硬伤。未传时按 UA 推断合理默认值。
     """
     log = log or (lambda m: logger.info(m))
     quickjs_script = _quickjs_script_path()
@@ -228,6 +246,26 @@ def get_sentinel_token_via_quickjs(
             if tag and tag not in languages:
                 languages.append(tag)
 
+    # ── 指纹一致性：platform / vendor 未显式传入时按 UA 推断，绝不写死 MacIntel ──
+    ua_l = (user_agent or "").lower()
+    if not platform:
+        if "iphone" in ua_l:
+            platform = "iPhone"
+        elif "windows" in ua_l:
+            platform = "Win32"
+        elif "mac" in ua_l:
+            platform = "MacIntel"
+        else:
+            platform = "Win32"
+    if vendor is None:
+        if "firefox" in ua_l:
+            vendor = ""                       # Firefox navigator.vendor 为空串
+        elif "chrome" in ua_l:
+            vendor = "Google Inc."
+        else:
+            vendor = "Apple Computer, Inc."   # Safari / iOS
+    hw_conc = int(hardware_concurrency) if hardware_concurrency else 8
+
     env_payload = {
         "device_id": did,
         "user_agent": user_agent or "Mozilla/5.0",
@@ -235,9 +273,17 @@ def get_sentinel_token_via_quickjs(
         "screen_height": screen_h,
         "language": lang_primary,
         "languages": languages,
-        "platform": "MacIntel",
-        "vendor": "Apple Computer, Inc.",
+        "platform": platform,
+        "vendor": vendor,
+        "hardware_concurrency": hw_conc,
+        "browser_type": browser_type or "",
+        "device_pixel_ratio": float(device_pixel_ratio) if device_pixel_ratio else 1.0,
+        "max_touch_points": int(max_touch_points),
+        "timezone": timezone or "UTC",  # IANA 时区名
     }
+    # deviceMemory 仅 Chromium 暴露；None 时不下发该键，JS 侧保持 undefined
+    if device_memory is not None:
+        env_payload["device_memory"] = int(device_memory)
 
     try:
         sdk_file = _ensure_sdk_file(session, timeout_ms)

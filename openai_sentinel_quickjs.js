@@ -220,15 +220,28 @@ function installRuntime(payload) {
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.document = document;
+  // 指纹一致性：platform/vendor 用 != null 判断，允许 Firefox 的空串 vendor
+  // 直接透传（`payload.vendor || default` 会把 "" 误当假值掉回 Apple）。
+  const navPlatform =
+    payload.platform != null ? String(payload.platform) : "MacIntel";
+  const navVendor =
+    payload.vendor != null ? String(payload.vendor) : "Apple Computer, Inc.";
   globalThis.navigator = {
     userAgent: String(payload.user_agent || "Mozilla/5.0"),
     language: String(payload.language || "en-US"),
     languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
     hardwareConcurrency: Number(payload.hardware_concurrency || 8),
-    platform: String(payload.platform || "MacIntel"),
-    vendor: String(payload.vendor || "Apple Computer, Inc."),
+    platform: navPlatform,
+    vendor: navVendor,
+    maxTouchPoints: Number(payload.max_touch_points || 0),
     webdriver: false,
   };
+  // deviceMemory 仅 Chromium 暴露：只有 payload 明确给了数值才定义该属性，
+  // 否则保持 undefined（Safari/Firefox 的真实行为）。
+  if (payload.device_memory != null && !Number.isNaN(Number(payload.device_memory))) {
+    globalThis.navigator.deviceMemory = Number(payload.device_memory);
+  }
+  globalThis.devicePixelRatio = Number(payload.device_pixel_ratio || 1);
   globalThis.location = {
     href: "https://auth.openai.com/",
     origin: "https://auth.openai.com",
@@ -241,6 +254,25 @@ function installRuntime(payload) {
   globalThis.sessionStorage = createStorage();
   globalThis.__sentinel_init_pending = [];
   globalThis.__sentinel_token_pending = [];
+
+  // 时区注入：Intl.DateTimeFormat().resolvedOptions().timeZone
+  const targetTimezone = String(payload.timezone || "UTC");
+  const DateTimeFormatOriginal = globalThis.Intl?.DateTimeFormat;
+  if (DateTimeFormatOriginal) {
+    globalThis.Intl.DateTimeFormat = function (locales, options) {
+      const instance = new DateTimeFormatOriginal(locales, options);
+      const originalResolvedOptions = instance.resolvedOptions.bind(instance);
+      instance.resolvedOptions = function () {
+        const resolved = originalResolvedOptions();
+        resolved.timeZone = targetTimezone;  // 强制注入目标时区
+        return resolved;
+      };
+      return instance;
+    };
+    // 保留静态方法
+    Object.setPrototypeOf(globalThis.Intl.DateTimeFormat, DateTimeFormatOriginal);
+    globalThis.Intl.DateTimeFormat.prototype = DateTimeFormatOriginal.prototype;
+  }
 
   globalThis.setTimeout = (cb) => {
     if (typeof cb === "function") cb();

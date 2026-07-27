@@ -64,7 +64,8 @@ class AuthFlow:
 
     def __init__(self, config: Config, sms_callback: Optional[Any] = None):
         self.config = config
-        self._fingerprint = generate_fingerprint()
+        self._country_code = ""  # IP 地理国家码，check_proxy() 时填充
+        self._fingerprint = generate_fingerprint()  # 先生成默认指纹
         self._ua = self._fingerprint["user_agent"]
         self._impersonate_candidates = self._fingerprint.get(
             "fallback_impersonates",
@@ -805,7 +806,7 @@ class AuthFlow:
                 logger.warning("Codex 登录推进需要 OTP，但未提供 mail_provider")
                 return continue_url or ""
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
             otp_sent_at = time.time()
@@ -1501,6 +1502,17 @@ class AuthFlow:
             headers["sec-ch-ua"] = fp["sec_ch_ua"]
             headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
             headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            # Client Hints 全套（仅 Chromium 有值，其他浏览器为空串不下发）
+            if fp.get("sec_ch_ua_full_version_list"):
+                headers["sec-ch-ua-full-version-list"] = fp["sec_ch_ua_full_version_list"]
+            if fp.get("sec_ch_ua_arch"):
+                headers["sec-ch-ua-arch"] = fp["sec_ch_ua_arch"]
+            if fp.get("sec_ch_ua_bitness"):
+                headers["sec-ch-ua-bitness"] = fp["sec_ch_ua_bitness"]
+            if fp.get("sec_ch_ua_model"):
+                headers["sec-ch-ua-model"] = fp["sec_ch_ua_model"]
+            if fp.get("sec_ch_ua_platform_version"):
+                headers["sec-ch-ua-platform-version"] = fp["sec_ch_ua_platform_version"]
 
         # auth.openai.com 侧请求补设备标识（若可得）
         try:
@@ -1523,8 +1535,19 @@ class AuthFlow:
             if resp.status_code == 200:
                 loc = re.search(r"loc=(\w+)", resp.text)
                 ip = re.search(r"ip=([^\n]+)", resp.text)
+                country_code = loc.group(1) if loc else ""
                 logger.info(f"网络正常 - IP: {ip.group(1) if ip else 'N/A'}, "
-                            f"地区: {loc.group(1) if loc else 'N/A'}")
+                            f"地区: {country_code or 'N/A'}")
+
+                # IP 地理联动：检测到国家码后，重新生成指纹（带时区/语言联动）
+                if country_code and country_code != self._country_code:
+                    self._country_code = country_code
+                    # 用原 RNG 种子重新生成（保证会话内硬件一致性）
+                    import random
+                    session_seed = id(self.session) % (2**32)  # 用 session 对象地址做种子
+                    rng = random.Random(session_seed)
+                    self._fingerprint = generate_fingerprint(rng=rng, country_code=country_code)
+                    self._ua = self._fingerprint["user_agent"]
             else:
                 logger.warning(f"网络探测异常: cloudflare trace {resp.status_code}")
 
@@ -1655,6 +1678,37 @@ class AuthFlow:
         return device_id
 
     # ── Step 5: 获取 Sentinel Token ──
+    def _sentinel_fp_kwargs(self) -> dict:
+        """从 self._fingerprint 抽出 sentinel 需要的指纹/硬件字段。
+
+        保证 4 处 sentinel 调用（authorize_continue / username_password_create /
+        create_account 等）用的是同一套一致画像——UA↔platform↔vendor↔硬件全程不变。
+        """
+        fp = self._fingerprint or {}
+        return {
+            "user_agent": self._ua,
+            "sec_ch_ua": fp.get("sec_ch_ua", ""),
+            "sec_ch_ua_platform": fp.get("sec_ch_ua_platform", ""),
+            "sec_ch_ua_mobile": fp.get("sec_ch_ua_mobile", ""),
+            # Client Hints 全套（仅 Chromium 有值）
+            "sec_ch_ua_full_version_list": fp.get("sec_ch_ua_full_version_list", ""),
+            "sec_ch_ua_arch": fp.get("sec_ch_ua_arch", ""),
+            "sec_ch_ua_bitness": fp.get("sec_ch_ua_bitness", ""),
+            "sec_ch_ua_model": fp.get("sec_ch_ua_model", ""),
+            "sec_ch_ua_platform_version": fp.get("sec_ch_ua_platform_version", ""),
+            "screen": fp.get("screen", ""),
+            "lang": fp.get("lang", ""),
+            "lang_full": fp.get("lang_full", ""),
+            "browser_type": fp.get("browser_type", ""),
+            "navigator_platform": fp.get("navigator_platform", ""),
+            "navigator_vendor": fp.get("navigator_vendor"),
+            "hardware_concurrency": fp.get("hardware_concurrency", 0),
+            "device_memory": fp.get("device_memory"),
+            "max_touch_points": fp.get("max_touch_points", 0),
+            "device_pixel_ratio": fp.get("device_pixel_ratio", 0.0),
+            "timezone": fp.get("timezone", ""),  # IP 联动时区
+        }
+
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
         from sentinel import get_sentinel_token
@@ -1662,13 +1716,7 @@ class AuthFlow:
             self.session,
             device_id=device_id,
             flow="authorize_continue",
-            user_agent=self._ua,
-            sec_ch_ua=self._fingerprint["sec_ch_ua"],
-            sec_ch_ua_platform=self._fingerprint.get("sec_ch_ua_platform", ""),
-            sec_ch_ua_mobile=self._fingerprint.get("sec_ch_ua_mobile", ""),
-            screen=self._fingerprint["screen"],
-            lang=self._fingerprint["lang"],
-            lang_full=self._fingerprint["lang_full"],
+            **self._sentinel_fp_kwargs(),
         )
         self._last_sentinel_token = token or ""
         logger.debug("Sentinel Token 获取成功")
@@ -1793,7 +1841,8 @@ class AuthFlow:
             try:
                 from sentinel import get_sentinel_token as _get_st
                 token = _get_st(self.session, device_id=self.result.device_id,
-                                flow="username_password_create")
+                                flow="username_password_create",
+                                **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
                 logger.debug("Sentinel Token 获取成功")
             except Exception as e:
@@ -1977,7 +2026,8 @@ class AuthFlow:
             try:
                 from sentinel import get_sentinel_token as _get_st
                 token = _get_st(self.session, device_id=self.result.device_id,
-                                flow="create_account")
+                                flow="create_account",
+                                **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
                 logger.debug("Sentinel Token 获取成功")
             except Exception as e:
@@ -2679,7 +2729,7 @@ class AuthFlow:
                     self.send_otp()
 
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
             otp_code = mail_provider.wait_for_otp(
@@ -2725,7 +2775,7 @@ class AuthFlow:
             continue_url = ""
 
             try:
-                otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+                otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
             except Exception:
                 otp_timeout = 180
 
@@ -2950,7 +3000,7 @@ class AuthFlow:
 
         continue_url = ""
         try:
-            otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "60")))
+            otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
         except Exception:
             otp_timeout = 180
 

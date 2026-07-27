@@ -95,7 +95,7 @@ $("#btnRun").addEventListener("click", async () => {
   const opts = {
     email: email || null,
     proxy: $("#regProxy").value.trim(),
-    otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
+    otp_timeout: parseInt($("#regOtpTimeout").value || "10", 10),
     want_access_token: true,
     want_session_token: true,
     want_refresh_token: true,
@@ -488,7 +488,7 @@ async function _doCheckPlus(uncheckedOnly) {
       if (td) td.innerHTML = `<span class="plus-status plus-${info.status}">${info.label}</span>`;
       if (info.status === "plus_eligible" || info.status === "plus_active") plusCount++;
       else if (info.status === "banned") bannedCount++;
-      else freeCount++;
+      else if (info.status === "free") freeCount++;
     }
     $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
     $("#checkPlusResult").className = "result ok";
@@ -503,6 +503,43 @@ async function _doCheckPlus(uncheckedOnly) {
 
 $("#btnCheckPlus").addEventListener("click", () => _doCheckPlus(true));
 $("#btnRecheckPlus").addEventListener("click", () => _doCheckPlus(false));
+$("#btnCheckSelected").addEventListener("click", () => _doCheckPlusSelected());
+
+// ── 检测选中的号 ──
+async function _doCheckPlusSelected() {
+  const emails = _selectedRegEmails();
+  if (!emails.length) return;
+  const proxy = $("#regProxy").value.trim();
+  $("#btnCheckSelected").disabled = true;
+  $("#btnCheckPlus").disabled = true;
+  $("#btnRecheckPlus").disabled = true;
+  $("#checkPlusResult").textContent = `检查中... (${emails.length} 个号)`;
+  try {
+    const { results } = await api("/api/registered/check_plus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ emails, proxy }),
+    });
+    let plusCount = 0, freeCount = 0, bannedCount = 0;
+    for (const [email, info] of Object.entries(results)) {
+      _plusCache[email] = info;
+      const td = document.querySelector(`[data-plus-email="${email}"]`);
+      if (td) td.innerHTML = `<span class="plus-status plus-${info.status}">${info.label}</span>`;
+      if (info.status === "plus_eligible" || info.status === "plus_active") plusCount++;
+      else if (info.status === "banned") bannedCount++;
+      else if (info.status === "free") freeCount++;
+    }
+    $("#checkPlusResult").textContent = `完成: ${plusCount} 可用Plus, ${freeCount} Free, ${bannedCount} 封号`;
+    $("#checkPlusResult").className = "result ok";
+  } catch (e) {
+    $("#checkPlusResult").textContent = "检查失败: " + e.message;
+    $("#checkPlusResult").className = "result bad";
+  } finally {
+    $("#btnCheckSelected").disabled = false;
+    $("#btnCheckPlus").disabled = false;
+    $("#btnRecheckPlus").disabled = false;
+  }
+}
 
 // ── 注册结果：复选框 + 批量删 + 单行删 ──
 
@@ -512,7 +549,9 @@ function _selectedRegEmails() {
 function _updateSelCountReg() {
   const n = _selectedRegEmails().length;
   $("#selCountReg").textContent = n;
+  $("#selCountCheck").textContent = n;
   $("#btnDeleteSelectedReg").disabled = n === 0;
+  $("#btnCheckSelected").disabled = n === 0;
 }
 $("#regTable").addEventListener("change", (e) => {
   if (e.target.classList.contains("reg-check")) _updateSelCountReg();
@@ -742,11 +781,12 @@ function _autoOptions() {
     proxy: $("#regProxy").value.trim(),
     proxy_pool: $("#autoProxyPool").value,
     concurrency: parseInt($("#autoConcurrency").value || "1", 10),
-    otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
+    otp_timeout: parseInt($("#regOtpTimeout").value || "10", 10),
     want_access_token: true,
     want_session_token: true,
     want_refresh_token: true,
     cool_down_seconds: parseFloat($("#autoCoolDown").value || "3") || 0,
+    target_count: parseInt($("#autoTargetCount").value || "0", 10) || 0,
   };
 }
 
@@ -779,10 +819,17 @@ function _renderAutoStatus(s) {
         return `<div class="auto-worker">worker-${w.id} ▶ <code>${escapeHtml(w.email)}</code> ${dur}${px}</div>`;
       }).join("")
     : "";
-  const meta = `并发=${s.concurrency || 1}` + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "");
+  const meta = `并发=${s.concurrency || 1}`
+    + (s.proxy_pool_size ? ` 代理池=${s.proxy_pool_size}` : "")
+    + (s.target_count ? ` 目标=${s.target_count}` : "");
+  // 有目标时显示 "成功 37 / 100（剩 63）"，否则显示纯成功数
+  const okDisplay = s.target_count
+    ? `<b class="ok">${s.registered_ok}</b> / ${s.target_count}`
+      + (s.remaining != null ? ` <span class="auto-meta">(剩 ${s.remaining})</span>` : "")
+    : `<b class="ok">${s.registered_ok}</b> 成功`;
   $("#autoStatus").innerHTML = `
     <b>${stateLabel}</b>
-    &nbsp;|&nbsp; 已完成: <b class="ok">${s.registered_ok}</b> 成功 / <b class="bad">${s.registered_fail}</b> 失败
+    &nbsp;|&nbsp; 已完成: ${okDisplay} / <b class="bad">${s.registered_fail}</b> 失败
     &nbsp;|&nbsp; 运行: ${elapsed}
     &nbsp;|&nbsp; <span class="auto-meta">${meta}</span>
     ${workerRows ? "<br>" + workerRows : ""}
@@ -855,6 +902,7 @@ const PERSIST_FIELDS = {
   autoCoolDown:    "text",
   autoConcurrency: "text",
   autoProxyPool:   "text",
+  autoTargetCount: "text",
 };
 
 function _saveForm() {

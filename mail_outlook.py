@@ -172,7 +172,11 @@ def fetch_otp_via_graph(
     while time.time() < deadline:
         for folder in GRAPH_FOLDERS:
             try:
-                messages = _graph_list_messages(access_token, folder)
+                messages = _graph_list_messages(
+                    access_token,
+                    folder,
+                    timeout=max(1.0, min(8.0, deadline - time.time())),
+                )
             except urllib.error.HTTPError as e:
                 if e.code == 401 and not token_refreshed:
                     try:
@@ -183,12 +187,23 @@ def fetch_otp_via_graph(
                         if data.get("refresh_token"):
                             cached_refresh = data["refresh_token"]
                         token_refreshed = True
-                        messages = _graph_list_messages(access_token, folder)
+                        messages = _graph_list_messages(
+                            access_token,
+                            folder,
+                            timeout=max(1.0, min(8.0, deadline - time.time())),
+                        )
                     except FatalOutlookMailError:
                         raise
+                    except urllib.error.HTTPError as e2:
+                        if e2.code in (401, 403):
+                            raise FatalOutlookMailError(
+                                f"Graph API no mail permission HTTP {e2.code}"
+                            ) from e2
+                        logger.debug(f"[outlook-graph] {folder} HTTP {e2.code}")
+                        continue
                     except Exception:
                         continue
-                elif e.code in (400, 403):
+                elif e.code in (400, 401, 403):
                     raise FatalOutlookMailError(
                         f"Graph API 无权限: HTTP {e.code}"
                     )
@@ -248,7 +263,7 @@ def fetch_otp_via_graph(
     raise TimeoutError(f"outlook Graph OTP timeout for {email_addr}")
 
 
-def _graph_list_messages(access_token: str, folder: str) -> list:
+def _graph_list_messages(access_token: str, folder: str, timeout: float = 15) -> list:
     params = urllib.parse.urlencode({
         "$top": "15",
         "$orderby": "receivedDateTime DESC",
@@ -259,7 +274,7 @@ def _graph_list_messages(access_token: str, folder: str) -> list:
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     })
-    resp = urllib.request.urlopen(req, timeout=15)
+    resp = urllib.request.urlopen(req, timeout=timeout)
     data = json.loads(resp.read())
     value = data.get("value") or []
     return value if isinstance(value, list) else []
@@ -307,8 +322,14 @@ def fetch_otp_via_imap(
                     cached_at = time.time()
                     if data.get("refresh_token"):
                         cached_refresh = data["refresh_token"]
-                except FatalOutlookMailError:
-                    logger.warning("[outlook-imap] XOAUTH2 token 获取失败，禁用")
+                except FatalOutlookMailError as e:
+                    logger.warning(f"[outlook-imap] XOAUTH2 token 获取失败: {e}，禁用")
+                    use_xoauth2 = False
+                    cached_token = ""
+                    if not use_password:
+                        raise
+                except Exception as e:
+                    logger.warning(f"[outlook-imap] XOAUTH2 token 获取异常: {e}，禁用")
                     use_xoauth2 = False
                     cached_token = ""
                     if not use_password:
@@ -335,8 +356,10 @@ def fetch_otp_via_imap(
                             pass
                         M = None
                         if _is_fatal_imap_error(e):
-                            use_xoauth2 = False
-                            cached_token = ""
+                            logger.info(
+                                f"[outlook-imap] XOAUTH2 host={host} failed, "
+                                "继续尝试其它 IMAP host"
+                            )
 
                 if not M and use_password:
                     try:
@@ -388,9 +411,6 @@ def fetch_otp_via_imap(
                     if "INBOX" not in picked:
                         picked.insert(0, "INBOX")
                     found_folders = picked
-                    logger.info(
-                        f"[outlook-imap] {email_addr} folders: {found_folders}"
-                    )
                 except Exception as e:
                     logger.warning(f"[outlook-imap] LIST 失败: {e}")
                     found_folders = list(folders_to_scan)
@@ -519,53 +539,57 @@ class OutlookMailProvider:
         timeout: int = 120,
         issued_after: Optional[float] = None,
     ) -> str:
-        timeout = max(int(timeout), 90)
+        method_timeout = max(1, int(timeout))
         strict_threshold = (issued_after - 5) if issued_after else (time.time() - 5)
-        deadline = time.time() + timeout
 
         has_oauth = bool(self.client_id and self.refresh_token)
         has_password = bool(self.password)
+        graph_error: Exception | None = None
 
-        # 1. Graph API
         if has_oauth:
             try:
                 logger.info(
                     f"[mail] Graph API 取 OTP -> {email_addr} "
-                    f"(timeout={timeout}s)"
+                    f"(timeout={method_timeout}s, IMAP兜底=Y)"
                 )
                 return fetch_otp_via_graph(
                     self.email,
                     self.refresh_token,
                     self.client_id,
-                    deadline=deadline,
+                    deadline=time.time() + method_timeout,
                     threshold_ts=strict_threshold,
                     target_email=email_addr,
                 )
-            except FatalOutlookMailError as e:
-                remaining = int(deadline - time.time())
+            except Exception as e:
+                graph_error = e
                 logger.warning(
-                    f"[mail] Graph 失败 ({e})，切换 IMAP (剩余 {remaining}s)"
+                    f"[mail] Graph 失败 ({type(e).__name__}: {e})，"
+                    f"切换 IMAP (timeout={method_timeout}s)"
                 )
-                if remaining < 15:
-                    raise TimeoutError(
-                        f"Graph 失败且剩余时间不足: {e}"
-                    ) from e
 
-        # 2. IMAP（XOAUTH2 优先 + 密码兜底）
         logger.info(
             f"[mail] IMAP 取 OTP -> {email_addr} "
-            f"(xoauth2={'Y' if has_oauth else 'N'} "
+            f"(timeout={method_timeout}s, "
+            f"xoauth2={'Y' if has_oauth else 'N'} "
             f"password={'Y' if has_password else 'N'})"
         )
-        return fetch_otp_via_imap(
-            self.email,
-            self.refresh_token,
-            self.client_id,
-            password=self.password if has_password else "",
-            deadline=deadline,
-            threshold_ts=strict_threshold,
-            target_email=email_addr,
-        )
+        try:
+            return fetch_otp_via_imap(
+                self.email,
+                self.refresh_token,
+                self.client_id,
+                password=self.password if has_password else "",
+                timeout=method_timeout,
+                threshold_ts=strict_threshold,
+                target_email=email_addr,
+            )
+        except Exception as e:
+            if graph_error is not None:
+                logger.warning(
+                    f"[mail] IMAP 也失败 ({type(e).__name__}: {e})；"
+                    f"Graph 先前错误: {type(graph_error).__name__}: {graph_error}"
+                )
+            raise
 
 
 if __name__ == "__main__":

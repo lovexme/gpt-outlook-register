@@ -52,7 +52,7 @@
         <input id="regProxy" placeholder="socks5://user:pass@host:1080">
       </label>
       <label>OTP 等待秒数
-        <input id="regOtpTimeout" type="number" value="180" min="30" max="600">
+        <input id="regOtpTimeout" type="number" value="10" min="10" max="600">
       </label>
 
       <div class="row">
@@ -71,6 +71,9 @@
         </label>
         <label class="check inline-check" title="每个 worker 跑完一个号的冷却（防风控）">
           冷却:<input id="autoCoolDown" type="number" value="3" min="0" max="120" style="width:60px;display:inline-block;margin-left:4px"> 秒
+        </label>
+        <label class="check inline-check" title="目标成功数：累计成功达标后自动停止；0 = 不限量">
+          目标:<input id="autoTargetCount" type="number" value="0" min="0" max="100000" style="width:70px;display:inline-block;margin-left:4px"> 个
         </label>
       </div>
       <div class="row">
@@ -154,6 +157,7 @@
         </select>
         <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
         <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
+        <button id="btnCheckSelected" title="检测已勾选的号" disabled>🔍 检测选中 (<span id="selCountCheck">0</span>)</button>
         <button id="btnCheckPlus" title="只检查当前页未检测的号">🔍 检查未检测</button>
         <button id="btnRecheckPlus" title="重新检查当前页所有号" style="font-size:12px;opacity:.7">🔄 重新检查</button>
         <span id="checkPlusResult" class="result"></span>
