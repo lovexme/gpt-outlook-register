@@ -16,7 +16,6 @@
     WEBUI_ALLOW_LOGIN    1 = 邮箱被 OpenAI 识为已注册时走 OTP login 拿凭证
                          (默认 0：fast-fail 抛 RuntimeError，换下一个号)
     SKIP_OAUTH_TOKEN_EXCHANGE  1=跳过 OAuth refresh_token 交换
-    OPENAI_SENTINEL_DISABLE_QUICKJS  1=禁用 QuickJS sentinel（仅纯 Python PoW）
     AUTH_HTTP_TRACE      1=打印每次 HTTP 请求详情（调试用）
 """
 from __future__ import annotations

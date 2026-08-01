@@ -1,3 +1,12 @@
+'use strict';
+
+const fs = require('node:fs');
+const vm = require('node:vm');
+const cryptoMod = require('node:crypto');
+
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const sdkRaw = fs.readFileSync(process.env.OPENAI_SENTINEL_SDK_FILE, 'utf8');
+
 const EXPOSE_PATCH = "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t}({});";
 const EXPOSE_REPLACEMENT =
   "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t}({});";
@@ -6,423 +15,596 @@ const INSTANCE_REPLACEMENT = "var P=new _;globalThis.__debugP=P;";
 const SDK_GLOBAL_PATCH = "var SentinelSDK=";
 const SDK_GLOBAL_REPLACEMENT = "globalThis.SentinelSDK=";
 
-function bytesToBase64(bytes) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let out = "";
-  let i = 0;
-  while (i < bytes.length) {
-    const b0 = bytes[i++] || 0;
-    const b1 = bytes[i++] || 0;
-    const b2 = bytes[i++] || 0;
-    const n = (b0 << 16) | (b1 << 8) | b2;
-    out += chars[(n >> 18) & 63];
-    out += chars[(n >> 12) & 63];
-    out += i - 2 < bytes.length ? chars[(n >> 6) & 63] : "=";
-    out += i - 1 < bytes.length ? chars[n & 63] : "=";
-  }
-  return out;
-}
+let sdk = sdkRaw;
+sdk = sdk.replace(SDK_GLOBAL_PATCH, SDK_GLOBAL_REPLACEMENT);
+sdk = sdk.replace(INSTANCE_PATCH, INSTANCE_REPLACEMENT);
+sdk = sdk.replace(EXPOSE_PATCH, EXPOSE_REPLACEMENT);
 
-function base64ToBytes(base64) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const clean = String(base64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
-  const bytes = [];
-  for (let i = 0; i < clean.length; i += 4) {
-    const c0 = chars.indexOf(clean[i]);
-    const c1 = chars.indexOf(clean[i + 1]);
-    const c2 = chars.indexOf(clean[i + 2]);
-    const c3 = chars.indexOf(clean[i + 3]);
-    const n = ((c0 & 63) << 18) | ((c1 & 63) << 12) | (((c2 < 0 ? 0 : c2) & 63) << 6) | ((c3 < 0 ? 0 : c3) & 63);
-    bytes.push((n >> 16) & 255);
-    if (clean[i + 2] !== "=") bytes.push((n >> 8) & 255);
-    if (clean[i + 3] !== "=") bytes.push(n & 255);
-  }
-  return bytes;
-}
+// ─── Helpers ───────────────────────────────────────────────────
 
 function createStorage() {
   const map = new Map();
   return {
-    get length() {
-      return map.size;
-    },
-    clear() {
-      map.clear();
-    },
-    getItem(key) {
-      return map.has(String(key)) ? map.get(String(key)) : null;
-    },
-    setItem(key, value) {
-      map.set(String(key), String(value));
-    },
-    removeItem(key) {
-      map.delete(String(key));
-    },
+    get length() { return map.size; },
+    clear() { map.clear(); },
+    getItem(key) { return map.has(String(key)) ? map.get(String(key)) : null; },
+    setItem(key, value) { map.set(String(key), String(value)); },
+    removeItem(key) { map.delete(String(key)); },
+    key(index) { return [...map.keys()][index] || null; },
   };
 }
 
-function createElement(tagName) {
-  const tag = String(tagName || "div").toLowerCase();
+function genericElement(tagName) {
+  const tag = String(tagName || 'div').toLowerCase();
   return {
     nodeType: 1,
     tagName: tag.toUpperCase(),
     nodeName: tag.toUpperCase(),
     style: {},
     children: [],
-    src: "",
-    appendChild(child) {
-      this.children.push(child);
-      return child;
-    },
-    removeChild(child) {
-      this.children = this.children.filter((x) => x !== child);
-      return child;
-    },
+    childNodes: [],
+    src: '',
+    id: '',
+    className: '',
+    innerHTML: '',
+    textContent: '',
+    parentNode: null,
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    removeChild(child) { this.children = this.children.filter(x => x !== child); return child; },
+    insertBefore(n) { this.children.push(n); return n; },
     setAttribute() {},
-    getAttribute() {
-      return null;
-    },
+    getAttribute() { return null; },
+    hasAttribute() { return false; },
+    removeAttribute() {},
     addEventListener() {},
     removeEventListener() {},
+    dispatchEvent() { return true; },
+    cloneNode() { return genericElement(tagName); },
+    contains() { return false; },
     getBoundingClientRect() {
       return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
     },
+    focus() {},
+    blur() {},
+    click() {},
   };
 }
 
-function installRuntime(payload) {
-  const screen = {
-    width: Number(payload.screen_width || 1366),
-    height: Number(payload.screen_height || 768),
-    availWidth: Number(payload.screen_width || 1366),
-    availHeight: Number(payload.screen_height || 768),
+function canvasElement() {
+  const el = genericElement('canvas');
+  el.width = 300;
+  el.height = 150;
+  el.toDataURL = () => 'data:image/png;base64,';
+  el.toBlob = (cb) => { if (cb) cb(new Uint8Array(0)); };
+  el.getContext = (kind) => {
+    if (kind === '2d') {
+      return {
+        fillRect() {}, clearRect() {}, strokeRect() {},
+        getImageData() { return { data: new Uint8Array(0) }; },
+        putImageData() {}, createImageData() { return { data: new Uint8Array(0) }; },
+        setTransform() {}, resetTransform() {}, drawImage() {},
+        save() {}, restore() {}, beginPath() {}, closePath() {},
+        moveTo() {}, lineTo() {}, clip() {}, quadraticCurveTo() {},
+        bezierCurveTo() {}, arc() {}, arcTo() {}, rect() {},
+        fill() {}, stroke() {}, measureText() { return { width: 0 }; },
+        fillText() {}, strokeText() {},
+        scale() {}, rotate() {}, translate() {},
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        canvas: el,
+        fillStyle: '', strokeStyle: '', lineWidth: 1, font: '10px sans-serif',
+        textAlign: 'start', textBaseline: 'alphabetic',
+        globalAlpha: 1, globalCompositeOperation: 'source-over',
+      };
+    }
+    if (!['webgl', 'experimental-webgl', 'webgl2'].includes(kind)) return null;
+    const dbg = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+    return {
+      VENDOR: 0x1F00, RENDERER: 0x1F01,
+      getExtension(name) { return name === 'WEBGL_debug_renderer_info' ? dbg : null; },
+      getParameter(p) {
+        if (p === dbg.UNMASKED_VENDOR_WEBGL || p === 0x1F00) return 'Google Inc. (Intel)';
+        if (p === dbg.UNMASKED_RENDERER_WEBGL || p === 0x1F01)
+          return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return 0;
+      },
+      getSupportedExtensions() { return ['WEBGL_debug_renderer_info']; },
+      createBuffer() { return {}; }, createTexture() { return {}; },
+      createShader() { return {}; }, createProgram() { return {}; },
+      bindBuffer() {}, bufferData() {}, bindTexture() {},
+      viewport() {}, clear() {}, enable() {}, disable() {},
+      drawArrays() {}, drawElements() {},
+      canvas: el,
+    };
+  };
+  return el;
+}
+
+// ─── Event listener infrastructure (shared between main & VM) ─
+
+const _listeners = new Map();
+
+function addListener(type, callback) {
+  if (typeof callback !== 'function') return;
+  const bucket = _listeners.get(type) || [];
+  bucket.push(callback);
+  _listeners.set(type, bucket);
+}
+
+function removeListener(type, callback) {
+  const bucket = _listeners.get(type) || [];
+  _listeners.set(type, bucket.filter(fn => fn !== callback));
+}
+
+async function dispatch(type, init) {
+  const event = {
+    type,
+    bubbles: true,
+    cancelable: true,
+    defaultPrevented: false,
+    timeStamp: performance.now(),
+    target: null,
+    currentTarget: null,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+    ...(init || {}),
+  };
+  for (const cb of [...(_listeners.get(type) || [])]) {
+    try { await cb(event); } catch (_) {}
+  }
+}
+
+// ─── iframe mock ───────────────────────────────────────────────
+
+let iframeObject = null;
+let capturedProof = null;
+
+// ─── Build the VM context ──────────────────────────────────────
+
+const screenW = Number(input.screen_width || 1920);
+const screenH = Number(input.screen_height || 1080);
+const scripts = [];
+
+const documentElement = genericElement('html');
+documentElement.clientWidth = screenW;
+documentElement.clientHeight = screenH;
+
+const bodyEl = genericElement('body');
+bodyEl.appendChild = function (child) {
+  this.children.push(child);
+  child.parentNode = this;
+  if (child === iframeObject) {
+    setTimeout(() => {
+      for (const cb of (iframeObject._load || [])) {
+        try { cb(); } catch (_) {}
+      }
+    }, 1);
+  }
+  return child;
+};
+
+const navPlatform = input.platform != null ? String(input.platform) : 'Win32';
+const navVendor = input.vendor != null ? String(input.vendor) : 'Google Inc.';
+
+const targetTz = String(input.timezone || 'UTC');
+const OrigDTF = Intl.DateTimeFormat;
+const PatchedDTF = function (locales, options) {
+  const inst = new OrigDTF(locales, options);
+  const orig = inst.resolvedOptions.bind(inst);
+  inst.resolvedOptions = function () { const r = orig(); r.timeZone = targetTz; return r; };
+  return inst;
+};
+Object.setPrototypeOf(PatchedDTF, OrigDTF);
+PatchedDTF.prototype = OrigDTF.prototype;
+PatchedDTF.supportedLocalesOf = OrigDTF.supportedLocalesOf;
+
+const navigatorObj = {
+  userAgent: String(input.user_agent || 'Mozilla/5.0'),
+  language: String(input.language || 'en-US'),
+  languages: Array.isArray(input.languages) ? input.languages : ['en-US', 'en'],
+  hardwareConcurrency: Number(input.hardware_concurrency || 8),
+  platform: navPlatform,
+  vendor: navVendor,
+  maxTouchPoints: Number(input.max_touch_points || 0),
+  webdriver: false,
+  onLine: true,
+  cookieEnabled: true,
+  doNotTrack: null,
+  appCodeName: 'Mozilla',
+  appName: 'Netscape',
+  appVersion: '5.0',
+  product: 'Gecko',
+  productSub: '20030107',
+  vendorSub: '',
+  connection: { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false },
+  plugins: { length: 5 },
+  mimeTypes: { length: 2 },
+  mediaDevices: { enumerateDevices: async () => [] },
+  getBattery: async () => ({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 }),
+  sendBeacon: () => true,
+  permissions: { query: async () => ({ state: 'prompt' }) },
+};
+if (input.device_memory != null && !Number.isNaN(Number(input.device_memory))) {
+  navigatorObj.deviceMemory = Number(input.device_memory);
+}
+
+const cryptoObj = {
+  getRandomValues: (arr) => { cryptoMod.randomFillSync(arr); return arr; },
+};
+if (typeof cryptoMod.randomUUID === 'function') {
+  cryptoObj.randomUUID = () => cryptoMod.randomUUID();
+}
+if (cryptoMod.webcrypto && cryptoMod.webcrypto.subtle) {
+  cryptoObj.subtle = cryptoMod.webcrypto.subtle;
+}
+
+const context = {
+  console,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  queueMicrotask,
+  Promise,
+  URL,
+  URLSearchParams,
+  Math,
+  Date,
+  JSON,
+  Array,
+  Object,
+  String,
+  Number,
+  Boolean,
+  RegExp,
+  Function,
+  Symbol,
+  Reflect,
+  Proxy,
+  Error,
+  TypeError,
+  RangeError,
+  ReferenceError,
+  SyntaxError,
+  Map,
+  Set,
+  WeakMap,
+  WeakSet,
+  Int8Array,
+  Uint8Array,
+  Uint8ClampedArray,
+  Int16Array,
+  Uint16Array,
+  Int32Array,
+  Uint32Array,
+  Float32Array,
+  Float64Array,
+  ArrayBuffer,
+  DataView,
+  TextEncoder,
+  TextDecoder,
+
+  btoa: (s) => Buffer.from(String(s || ''), 'binary').toString('base64'),
+  atob: (s) => Buffer.from(String(s || ''), 'base64').toString('binary'),
+  unescape,
+  encodeURIComponent,
+  decodeURIComponent,
+  encodeURI,
+  decodeURI,
+  parseInt,
+  parseFloat,
+  isFinite,
+  isNaN,
+  NaN,
+  Infinity,
+  undefined,
+  Intl: { ...Intl, DateTimeFormat: PatchedDTF },
+
+  crypto: cryptoObj,
+
+  performance: {
+    now: () => performance.now(),
+    timeOrigin: performance.timeOrigin,
+    memory: { jsHeapSizeLimit: 4294967296 },
+    getEntriesByType: () => [],
+    getEntriesByName: () => [],
+    mark: () => {},
+    measure: () => {},
+  },
+
+  screen: {
+    width: screenW,
+    height: screenH,
+    availWidth: screenW,
+    availHeight: screenH,
     colorDepth: 24,
     pixelDepth: 24,
-  };
-  const scripts = [];
-  const documentElement = createElement("html");
-  documentElement.clientWidth = screen.width;
-  documentElement.clientHeight = screen.height;
-  const document = {
-    readyState: "complete",
+    orientation: { type: 'landscape-primary', angle: 0 },
+  },
+
+  navigator: navigatorObj,
+
+  history: {
+    length: 1, state: null,
+    back() {}, forward() {}, go() {},
+    pushState() {}, replaceState() {},
+  },
+
+  localStorage: createStorage(),
+  sessionStorage: createStorage(),
+
+  innerWidth: screenW,
+  innerHeight: screenH,
+  outerWidth: screenW,
+  outerHeight: screenH + 80,
+  devicePixelRatio: Number(input.device_pixel_ratio || 1),
+  scrollX: 0,
+  scrollY: 0,
+  pageXOffset: 0,
+  pageYOffset: 0,
+
+  requestAnimationFrame: (cb) => { setTimeout(cb, 16); return 1; },
+  cancelAnimationFrame: () => {},
+  requestIdleCallback: (cb) => {
+    if (typeof cb === 'function') cb({ didTimeout: false, timeRemaining: () => 50 });
+    return 1;
+  },
+  cancelIdleCallback: () => {},
+
+  getComputedStyle: () => ({ getPropertyValue() { return ''; } }),
+  matchMedia: (query) => ({
+    media: String(query || ''),
+    matches: false,
+    onchange: null,
+    addListener() {}, removeListener() {},
+    addEventListener() {}, removeEventListener() {},
+    dispatchEvent() { return false; },
+  }),
+
+  Event: class Event {
+    constructor(type, init) {
+      this.type = type;
+      this.bubbles = (init && init.bubbles) || false;
+      this.cancelable = (init && init.cancelable) || false;
+    }
+  },
+  CustomEvent: class CustomEvent {
+    constructor(type, init) {
+      this.type = type;
+      this.detail = init && Object.prototype.hasOwnProperty.call(init, 'detail') ? init.detail : null;
+    }
+  },
+  MessageChannel: class MessageChannel {
+    constructor() {
+      this.port1 = { postMessage() {}, addEventListener() {}, removeEventListener() {}, start() {}, close() {} };
+      this.port2 = { postMessage() {}, addEventListener() {}, removeEventListener() {}, start() {}, close() {} };
+    }
+  },
+
+  chrome: { runtime: {}, app: {} },
+  CSS: { supports() { return true; } },
+  indexedDB: {
+    open() { return { onerror: null, onsuccess: null, onupgradeneeded: null, result: {}, error: null }; },
+    deleteDatabase() { return {}; },
+  },
+
+  fetch: async () => { throw new Error('fetch should not be called'); },
+  postMessage: () => {},
+
+  addEventListener: addListener,
+  removeEventListener: removeListener,
+  dispatchEvent: (event) => { dispatch(event.type, event); return true; },
+
+  origin: 'https://auth.openai.com',
+
+  location: {
+    href: 'https://auth.openai.com/',
+    origin: 'https://auth.openai.com',
+    protocol: 'https:',
+    host: 'auth.openai.com',
+    hostname: 'auth.openai.com',
+    pathname: '/',
+    search: '',
+    hash: '',
+    assign() {},
+    replace() {},
+    reload() {},
+  },
+
+  document: {
+    readyState: 'complete',
     hidden: false,
-    visibilityState: "visible",
-    referrer: "https://auth.openai.com/",
-    URL: "https://auth.openai.com/",
-    cookie: `oai-did=${encodeURIComponent(payload.device_id || "")}`,
+    visibilityState: 'visible',
+    referrer: 'https://auth.openai.com/',
+    URL: 'https://auth.openai.com/',
+    documentURI: 'https://auth.openai.com/',
+    location: {
+      href: 'https://auth.openai.com/',
+      origin: 'https://auth.openai.com',
+      pathname: '/',
+      search: '',
+    },
+    cookie: 'oai-did=' + encodeURIComponent(input.device_id || ''),
+    title: '',
+    characterSet: 'UTF-8',
+    contentType: 'text/html',
     scripts,
-    currentScript: { src: "https://sentinel.openai.com/sentinel/sdk.js", getAttribute() { return null; } },
+    currentScript: {
+      src: 'https://sentinel.openai.com/sentinel/sdk.js',
+      getAttribute() { return null; },
+    },
     documentElement,
-    body: createElement("body"),
-    head: createElement("head"),
+    body: bodyEl,
+    head: genericElement('head'),
     createElement(tag) {
-      const el = createElement(tag);
-      if (String(tag).toLowerCase() === "script") scripts.push(el);
+      const t = String(tag || '').toLowerCase();
+      if (t === 'canvas') return canvasElement();
+      if (t === 'iframe') {
+        iframeObject = genericElement('iframe');
+        iframeObject._load = [];
+        iframeObject.addEventListener = (type, cb) => {
+          if (type === 'load') iframeObject._load.push(cb);
+        };
+        iframeObject.removeEventListener = () => {};
+        iframeObject.contentWindow = {
+          postMessage(message, origin) {
+            capturedProof = message.p;
+            const result = input.action === 'solve'
+              ? { cachedChatReq: input.challenge, cachedProof: input.request_p || message.p }
+              : null;
+            const ev = {
+              source: iframeObject.contentWindow,
+              data: { type: 'response', requestId: message.requestId, result },
+              origin,
+            };
+            setTimeout(() => {
+              for (const cb of [...(_listeners.get('message') || [])]) {
+                try { cb(ev); } catch (_) {}
+              }
+            }, 0);
+          },
+        };
+        return iframeObject;
+      }
+      const el = genericElement(tag);
+      if (t === 'script') scripts.push(el);
       return el;
     },
-    createElementNS(_ns, tag) {
-      return this.createElement(tag);
-    },
-    querySelector() {
-      return null;
-    },
-    querySelectorAll() {
-      return [];
-    },
-    getElementById() {
-      return null;
-    },
-    getElementsByTagName() {
-      return [];
-    },
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {
-      return true;
-    },
-  };
+    createElementNS(_ns, tag) { return this.createElement(tag); },
+    createDocumentFragment() { return genericElement('fragment'); },
+    createTextNode(text) { return { nodeType: 3, textContent: text }; },
+    createComment(text) { return { nodeType: 8, textContent: text }; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getElementById() { return null; },
+    getElementsByTagName(tag) { return tag === 'script' ? scripts : []; },
+    getElementsByClassName() { return []; },
+    addEventListener: addListener,
+    removeEventListener: removeListener,
+    dispatchEvent(event) { dispatch(event.type, event); return true; },
+  },
+};
 
-  const performance = {
-    now: () => Number(payload.performance_now || 12345.67),
-    timeOrigin: Number(payload.time_origin || 1710000000000),
-    memory: { jsHeapSizeLimit: Number(payload.js_heap_size_limit || 4294967296) },
-  };
+context.window = context;
+context.globalThis = context;
+context.self = context;
+context.top = context;
+context.parent = context;
 
-  class TextEncoderPoly {
-    encode(text) {
-      const str = String(text || "");
-      const out = new Uint8Array(str.length);
-      for (let i = 0; i < str.length; i += 1) out[i] = str.charCodeAt(i) & 255;
-      return out;
-    }
-  }
+// ─── Create VM sandbox & load SDK ──────────────────────────────
 
-  class TextDecoderPoly {
-    decode(input) {
-      if (!input) return "";
-      let out = "";
-      for (let i = 0; i < input.length; i += 1) {
-        out += String.fromCharCode(input[i]);
-      }
-      return out;
-    }
-  }
+vm.createContext(context);
+vm.runInContext(sdk, context, { timeout: 10000 });
 
-  class URLSearchParamsPoly {
-    constructor(search) {
-      this._pairs = [];
-      const s = String(search || "").replace(/^\?/, "");
-      if (!s) return;
-      const parts = s.split("&");
-      for (const p of parts) {
-        if (!p) continue;
-        const i = p.indexOf("=");
-        if (i < 0) {
-          this._pairs.push([decodeURIComponent(p), ""]);
-        } else {
-          this._pairs.push([
-            decodeURIComponent(p.slice(0, i)),
-            decodeURIComponent(p.slice(i + 1)),
-          ]);
-        }
-      }
-    }
-    keys() {
-      return this._pairs.map((x) => x[0])[Symbol.iterator]();
-    }
-  }
+// ─── Behavior simulation ──────────────────────────────────────
 
-  class URLPoly {
-    constructor(input, base) {
-      const raw = String(input || "");
-      if (/^https?:\/\//i.test(raw)) {
-        this.href = raw;
-      } else {
-        const b = String(base || "https://auth.openai.com/").replace(/\/$/, "");
-        this.href = `${b}/${raw.replace(/^\//, "")}`;
-      }
-      const m = this.href.match(/^(https?:)\/\/([^\/]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
-      this.protocol = m ? m[1] : "https:";
-      this.host = m ? m[2] : "auth.openai.com";
-      this.hostname = this.host;
-      this.pathname = m && m[3] ? m[3] : "/";
-      this.search = m && m[4] ? m[4] : "";
-      this.hash = m && m[5] ? m[5] : "";
-      this.origin = `${this.protocol}//${this.host}`;
-    }
-    toString() {
-      return this.href;
-    }
-  }
-
-  globalThis.window = globalThis;
-  globalThis.self = globalThis;
-  globalThis.top = globalThis;
-  globalThis.parent = globalThis;
-  globalThis.document = document;
-  // 指纹一致性：platform/vendor 用 != null 判断，允许 Firefox 的空串 vendor
-  // 直接透传（`payload.vendor || default` 会把 "" 误当假值掉回 Apple）。
-  const navPlatform =
-    payload.platform != null ? String(payload.platform) : "MacIntel";
-  const navVendor =
-    payload.vendor != null ? String(payload.vendor) : "Apple Computer, Inc.";
-  globalThis.navigator = {
-    userAgent: String(payload.user_agent || "Mozilla/5.0"),
-    language: String(payload.language || "en-US"),
-    languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
-    hardwareConcurrency: Number(payload.hardware_concurrency || 8),
-    platform: navPlatform,
-    vendor: navVendor,
-    maxTouchPoints: Number(payload.max_touch_points || 0),
-    webdriver: false,
-  };
-  // deviceMemory 仅 Chromium 暴露：只有 payload 明确给了数值才定义该属性，
-  // 否则保持 undefined（Safari/Firefox 的真实行为）。
-  if (payload.device_memory != null && !Number.isNaN(Number(payload.device_memory))) {
-    globalThis.navigator.deviceMemory = Number(payload.device_memory);
-  }
-  globalThis.devicePixelRatio = Number(payload.device_pixel_ratio || 1);
-  globalThis.location = {
-    href: "https://auth.openai.com/",
-    origin: "https://auth.openai.com",
-    pathname: "/",
-    search: "",
-  };
-  globalThis.screen = screen;
-  globalThis.performance = performance;
-  globalThis.localStorage = createStorage();
-  globalThis.sessionStorage = createStorage();
-  globalThis.__sentinel_init_pending = [];
-  globalThis.__sentinel_token_pending = [];
-
-  // 时区注入：Intl.DateTimeFormat().resolvedOptions().timeZone
-  const targetTimezone = String(payload.timezone || "UTC");
-  const DateTimeFormatOriginal = globalThis.Intl?.DateTimeFormat;
-  if (DateTimeFormatOriginal) {
-    globalThis.Intl.DateTimeFormat = function (locales, options) {
-      const instance = new DateTimeFormatOriginal(locales, options);
-      const originalResolvedOptions = instance.resolvedOptions.bind(instance);
-      instance.resolvedOptions = function () {
-        const resolved = originalResolvedOptions();
-        resolved.timeZone = targetTimezone;  // 强制注入目标时区
-        return resolved;
-      };
-      return instance;
-    };
-    // 保留静态方法
-    Object.setPrototypeOf(globalThis.Intl.DateTimeFormat, DateTimeFormatOriginal);
-    globalThis.Intl.DateTimeFormat.prototype = DateTimeFormatOriginal.prototype;
-  }
-
-  globalThis.setTimeout = (cb) => {
-    if (typeof cb === "function") cb();
-    return 1;
-  };
-  globalThis.clearTimeout = () => {};
-  globalThis.setInterval = () => 1;
-  globalThis.clearInterval = () => {};
-  globalThis.requestIdleCallback = (cb) => {
-    if (typeof cb === "function") cb({ didTimeout: false, timeRemaining: () => 50 });
-    return 1;
-  };
-  globalThis.cancelIdleCallback = () => {};
-  globalThis.addEventListener = () => {};
-  globalThis.removeEventListener = () => {};
-  globalThis.dispatchEvent = () => true;
-  globalThis.postMessage = () => {};
-
-  globalThis.atob = (input) => String.fromCharCode(...base64ToBytes(input));
-  globalThis.btoa = (input) => {
-    const str = String(input || "");
-    const bytes = [];
-    for (let i = 0; i < str.length; i += 1) bytes.push(str.charCodeAt(i) & 255);
-    return bytesToBase64(bytes);
-  };
-  globalThis.TextEncoder = globalThis.TextEncoder || TextEncoderPoly;
-  globalThis.TextDecoder = globalThis.TextDecoder || TextDecoderPoly;
-  globalThis.URL = globalThis.URL || URLPoly;
-  globalThis.URLSearchParams = globalThis.URLSearchParams || URLSearchParamsPoly;
-  globalThis.Event =
-    globalThis.Event ||
-    class Event {
-      constructor(type) {
-        this.type = type;
-      }
-    };
-  globalThis.CustomEvent =
-    globalThis.CustomEvent ||
-    class CustomEvent extends globalThis.Event {
-      constructor(type, init) {
-        super(type);
-        this.detail = init && Object.prototype.hasOwnProperty.call(init, "detail") ? init.detail : null;
-      }
-    };
-  globalThis.MessageChannel =
-    globalThis.MessageChannel ||
-    class MessageChannel {
-      constructor() {
-        this.port1 = { postMessage() {}, addEventListener() {}, removeEventListener() {}, start() {}, close() {} };
-        this.port2 = { postMessage() {}, addEventListener() {}, removeEventListener() {}, start() {}, close() {} };
-      }
-    };
-  globalThis.matchMedia =
-    globalThis.matchMedia ||
-    ((query) => ({
-      media: String(query || ""),
-      matches: false,
-      onchange: null,
-      addListener() {},
-      removeListener() {},
-      addEventListener() {},
-      removeEventListener() {},
-      dispatchEvent() {
-        return false;
-      },
-    }));
-  globalThis.getComputedStyle =
-    globalThis.getComputedStyle ||
-    (() => ({
-      getPropertyValue() {
-        return "";
-      },
-    }));
-  globalThis.history = globalThis.history || { length: 1, state: null, back() {}, forward() {}, go() {}, pushState() {}, replaceState() {} };
-  globalThis.chrome = globalThis.chrome || { runtime: {}, app: {} };
-  globalThis.CSS = globalThis.CSS || { supports() { return true; } };
-  globalThis.indexedDB =
-    globalThis.indexedDB ||
-    {
-      open() {
-        return { onerror: null, onsuccess: null, onupgradeneeded: null, result: {}, error: null };
-      },
-      deleteDatabase() {
-        return {};
-      },
-    };
-  globalThis.fetch = async () => {
-    throw new Error("fetch should not be called");
-  };
-
-  const randomFill = (arr) => {
-    for (let i = 0; i < arr.length; i += 1) {
-      arr[i] = Math.floor(Math.random() * 256);
-    }
-    return arr;
-  };
-  globalThis.crypto = {
-    randomUUID: globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
-      ? globalThis.crypto.randomUUID.bind(globalThis.crypto)
-      : undefined,
-    getRandomValues: randomFill,
-  };
+function _rng(min, max) {
+  return min + Math.floor(Math.random() * Math.max(1, max - min + 1));
 }
 
-function loadPatchedSdk(sdkSource) {
-  let sdk = String(sdkSource || "");
-  sdk = sdk.replace(SDK_GLOBAL_PATCH, SDK_GLOBAL_REPLACEMENT);
-  sdk = sdk.replace(INSTANCE_PATCH, INSTANCE_REPLACEMENT);
-  sdk = sdk.replace(EXPOSE_PATCH, EXPOSE_REPLACEMENT);
-  eval(sdk);
+async function dispatchBehavior(durationMs) {
+  const started = Date.now();
+  const moves = _rng(12, 16);
+  let x = _rng(260, 420);
+  let y = _rng(180, 300);
+  for (let i = 0; i < moves; i++) {
+    const dx = _rng(5, 18);
+    const dy = _rng(-4, 12);
+    x += dx;
+    y += dy;
+    await new Promise(r => setTimeout(r, _rng(70, 145)));
+    await dispatch('pointermove', {
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      movementX: dx, movementY: dy, buttons: 0,
+    });
+  }
+  await new Promise(r => setTimeout(r, _rng(90, 220)));
+  await dispatch('click', {
+    clientX: x, clientY: y, screenX: x, screenY: y, button: 0, buttons: 0,
+  });
+  for (let i = 0; i < _rng(3, 4); i++) {
+    await new Promise(r => setTimeout(r, _rng(80, 180)));
+    context.scrollY = (context.scrollY || 0) + _rng(35, 120);
+    context.pageYOffset = context.scrollY;
+    await dispatch('scroll', { scrollX: 0, scrollY: context.scrollY });
+  }
+  await new Promise(r => setTimeout(r, _rng(80, 160)));
+  await dispatch('wheel', {
+    deltaX: 0, deltaY: _rng(70, 140), clientX: x, clientY: y,
+  });
+  const keys = ['L', 'u', 'Tab'];
+  for (const key of keys) {
+    await new Promise(r => setTimeout(r, _rng(90, 210)));
+    await dispatch('keydown', {
+      key,
+      code: key === 'Tab' ? 'Tab' : 'Key' + key.toUpperCase(),
+      repeat: false, altKey: false, ctrlKey: false, metaKey: false,
+    });
+  }
+  const remaining = Math.max(0, Number(durationMs || 0) - (Date.now() - started));
+  if (remaining > 0) await new Promise(r => setTimeout(r, remaining));
 }
 
-async function run(payload, sdkSource) {
-  installRuntime(payload);
-  loadPatchedSdk(sdkSource);
-
-  if (payload.action === "requirements") {
-    const requestP = await globalThis.__debugP.getRequirementsToken();
-    return { request_p: requestP };
-  }
-
-  if (payload.action === "solve") {
-    const challenge = payload.challenge || {};
-    const requestP = String(payload.request_p || "").trim();
-    if (!requestP) throw new Error("missing request_p");
-    const finalP = await globalThis.__debugP.getEnforcementToken(challenge);
-    globalThis.SentinelSDK.__debug_bindProof(challenge, requestP);
-    const dx = challenge && challenge.turnstile ? challenge.turnstile.dx : null;
-    const tValue = dx ? await globalThis.SentinelSDK.__debug_n(challenge, dx) : null;
-    return { final_p: finalP, t: tValue };
-  }
-
-  throw new Error(`unsupported action: ${payload.action}`);
-}
+// ─── Main ──────────────────────────────────────────────────────
 
 (async () => {
-  try {
-    const payload = JSON.parse(String(globalThis.__payload_json || "{}"));
-    const sdkSource = String(globalThis.__sdk_source || "");
-    const result = await run(payload, sdkSource);
-    globalThis.__vm_output_json = JSON.stringify(result);
-  } catch (error) {
-    const detail = {
-      name: error && error.name ? String(error.name) : "Error",
-      message: error && error.message ? String(error.message) : String(error),
-      stack: error && error.stack ? String(error.stack) : String(error),
-    };
-    const message = `${detail.name}: ${detail.message}\n${detail.stack}`;
-    globalThis.__vm_error = message;
-  } finally {
-    globalThis.__vm_done = true;
+  const action = input.action;
+  const flow = String(input.flow || 'authorize_continue');
+
+  if (action === 'requirements') {
+    try {
+      await Promise.race([
+        context.SentinelSDK.init(flow),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), 8000)),
+      ]);
+      if (capturedProof) {
+        process.stdout.write(JSON.stringify({ request_p: capturedProof }));
+        return;
+      }
+    } catch (_) {}
+    const requestP = await context.__debugP.getRequirementsToken();
+    process.stdout.write(JSON.stringify({ request_p: requestP }));
+    return;
   }
-})();
+
+  if (action === 'solve') {
+    const behaviorMs = Number(input.behavior_duration_ms || 4200);
+
+    try {
+      const mainToken = await Promise.race([
+        context.SentinelSDK.token(flow),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('SDK token timeout')), 8000)),
+      ]);
+      if (mainToken) {
+        await dispatchBehavior(behaviorMs);
+        let soToken = '';
+        try {
+          soToken = await Promise.race([
+            context.SentinelSDK.sessionObserverToken(flow),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('SO timeout')), 5000)),
+          ]);
+        } catch (_) {
+          soToken = '';
+        }
+        process.stdout.write(JSON.stringify({ token: mainToken, so_token: soToken || '' }));
+        return;
+      }
+    } catch (_) {}
+
+    const challenge = input.challenge || {};
+    const requestP = String(input.request_p || '').trim();
+    if (!requestP) throw new Error('missing request_p');
+    const finalP = await context.__debugP.getEnforcementToken(challenge);
+    context.SentinelSDK.__debug_bindProof(challenge, requestP);
+    const dx = challenge && challenge.turnstile ? challenge.turnstile.dx : null;
+    const tValue = dx ? await context.SentinelSDK.__debug_n(challenge, dx) : null;
+    process.stdout.write(JSON.stringify({ final_p: finalP, t: tValue, so_token: '' }));
+    return;
+  }
+
+  throw new Error('unsupported action: ' + action);
+})().catch(err => {
+  process.stderr.write(String((err && err.stack) || err));
+  process.exit(1);
+});

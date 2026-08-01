@@ -247,7 +247,6 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 | `SKIP_OAUTH_TOKEN_EXCHANGE` | `0` | `1`=跳过 OAuth refresh_token 交换 |
 | `OAUTH_CODEX_RT_EXCHANGE` | `1` | `1`=尝试 Codex OAuth 拿 refresh_token |
 | `OAUTH_REFRESH_ONLY` | `0` | `1`=只要 refresh_token，跳过 session 步骤 |
-| `OPENAI_SENTINEL_DISABLE_QUICKJS` | - | 设任意值 = 禁用 QuickJS，仅用纯 Python PoW |
 | `OPENAI_SENTINEL_NODE_PATH` | `node` | node 二进制路径 |
 | `LOGIN_PASSWORD` | - | 已有账号 login_password 分支用的密码（不设则取 email 去 @） |
 | `AUTH_HTTP_TRACE` | `0` | `1`=打印每次 HTTP 请求 method/url/status/cookies（调试用） |

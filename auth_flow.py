@@ -1446,26 +1446,18 @@ class AuthFlow:
 
     @staticmethod
     def _datadog_trace_headers() -> dict:
-        """生成 Datadog APM 追踪头。
-
-        OpenAI 前端集成 Datadog RUM，所有真实浏览器请求都带这 6 个头；
-        缺失会被风控判定为非浏览器会话，OTP 邮件等敏感操作会被 silent-drop
-        （接口返 200 但邮件不下发）。
-
-        参考 https://github.com/zc-zhangchen/any-auto-register
-        platforms/chatgpt/utils.py:generate_datadog_trace（MIT）。
-        """
-        trace_id = str(random.getrandbits(64))
-        parent_id = str(random.getrandbits(64))
-        trace_hex = format(int(trace_id), "016x")
-        parent_hex = format(int(parent_id), "016x")
+        """生成 Datadog RUM 追踪头（对齐 gptfree-register 格式）。"""
+        tid = f"{random.getrandbits(64):016x}"
+        sid = str(random.getrandbits(63))
+        pid = str(random.getrandbits(63))
+        ts_hex = f"{int(time.time()):08x}"
         return {
-            "traceparent": f"00-0000000000000000{trace_hex}-{parent_hex}-01",
-            "tracestate": "dd=s:1;o:rum",
-            "x-datadog-origin": "rum",
-            "x-datadog-parent-id": parent_id,
+            "traceparent": f"00-0000000000000000{tid}-{random.getrandbits(64):016x}-01",
+            "x-datadog-trace-id": sid,
+            "x-datadog-parent-id": pid,
             "x-datadog-sampling-priority": "1",
-            "x-datadog-trace-id": trace_id,
+            "x-datadog-origin": "rum",
+            "x-datadog-tags": f"_dd.p.id={tid},_dd.p.tid={ts_hex}00000000,_dd.b.sr=1",
         }
 
     def _common_headers(self, referer: str = "https://chatgpt.com/") -> dict:
@@ -1493,10 +1485,11 @@ class AuthFlow:
             "Origin": origin,
             "User-Agent": self._ua,
             "Accept-Language": fp["lang_full"],
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
+            "priority": "u=1, i",
         }
         if fp.get("sec_ch_ua"):
             headers["sec-ch-ua"] = fp["sec_ch_ua"]
@@ -1527,6 +1520,24 @@ class AuthFlow:
         headers.update(self._datadog_trace_headers())
         return headers
 
+    def warmup(self) -> bool:
+        """GET chatgpt.com 首页获取 __cf_bm cookie（Cloudflare 预热 + 连通性验证）。"""
+        try:
+            resp = self.session.get("https://chatgpt.com", headers={
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "upgrade-insecure-requests": "1",
+                "User-Agent": self._ua,
+            }, timeout=15)
+            logger.info("chatgpt.com warmup 完成")
+            return True
+        except Exception as e:
+            logger.warning(f"Cloudflare warmup 失败: {e}")
+            return False
+
     # ── Step 1: 检查代理连通性 ──
     def check_proxy(self) -> bool:
         logger.info("检查网络连通性...")
@@ -1542,28 +1553,26 @@ class AuthFlow:
                 # IP 地理联动：检测到国家码后，重新生成指纹（带时区/语言联动）
                 if country_code and country_code != self._country_code:
                     self._country_code = country_code
-                    # 用原 RNG 种子重新生成（保证会话内硬件一致性）
                     import random
-                    session_seed = id(self.session) % (2**32)  # 用 session 对象地址做种子
+                    session_seed = id(self.session) % (2**32)
                     rng = random.Random(session_seed)
                     self._fingerprint = generate_fingerprint(rng=rng, country_code=country_code)
                     self._ua = self._fingerprint["user_agent"]
+                    new_imp = self._fingerprint["impersonate"]
+                    self._impersonate_candidates = self._fingerprint.get(
+                        "fallback_impersonates",
+                        [new_imp, "safari17_0", "safari15_5"],
+                    )
+                    self._impersonate_idx = 0
+                    self.session = create_http_session(
+                        proxy=self.config.proxy,
+                        impersonate=new_imp,
+                        user_agent=self._ua,
+                    )
             else:
                 logger.warning(f"网络探测异常: cloudflare trace {resp.status_code}")
 
-            # 关键链路探测: chatgpt csrf
-            csrf_headers = self._common_headers("https://chatgpt.com/auth/login")
-            csrf_resp = self.session.get(
-                "https://chatgpt.com/api/auth/csrf",
-                headers=csrf_headers,
-                timeout=20,
-            )
-            if csrf_resp.status_code == 200:
-                logger.info("chatgpt csrf 连通正常")
-                return True
-
-            logger.warning(f"chatgpt csrf 连通异常: {csrf_resp.status_code}")
-            return False
+            return True
         except Exception as e:
             logger.error(f"网络检查失败: {e}")
         return False
@@ -1608,12 +1617,24 @@ class AuthFlow:
         return csrf
 
     # ── Step 3: 获取 auth URL ──
-    def get_auth_url(self, csrf_token: str) -> str:
+    def get_auth_url(self, csrf_token: str, email: str = "") -> str:
         logger.info("[2/10] 获取 OpenAI 授权地址...")
         headers = self._common_headers("https://chatgpt.com/auth/login")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if not self.result.device_id:
+            self.result.device_id = str(uuid.uuid4())
+        query_params: dict[str, str] = {
+            "prompt": "login",
+            "screen_hint": "login_or_signup",
+            "ext-oai-did": self.result.device_id,
+            "auth_session_logging_id": str(uuid.uuid4()),
+            "ext-passkey-client-capabilities": "1111",
+        }
+        if email:
+            query_params["login_hint"] = email
+        signin_url = f"https://chatgpt.com/api/auth/signin/openai?{urlencode(query_params)}"
         resp = self.session.post(
-            "https://chatgpt.com/api/auth/signin/openai",
+            signin_url,
             headers=headers,
             data={
                 "csrfToken": csrf_token,
@@ -1640,7 +1661,7 @@ class AuthFlow:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://chatgpt.com/auth/login",
-            "User-Agent": self._common_headers()["User-Agent"],
+            "User-Agent": self._ua,
         }
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
@@ -1712,13 +1733,15 @@ class AuthFlow:
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
         from sentinel import get_sentinel_token
-        token = get_sentinel_token(
+        result = get_sentinel_token(
             self.session,
             device_id=device_id,
             flow="authorize_continue",
             **self._sentinel_fp_kwargs(),
         )
+        token, so_token = result
         self._last_sentinel_token = token or ""
+        self._last_sentinel_so_token = so_token or ""
         logger.debug("Sentinel Token 获取成功")
         return token
 
@@ -1736,6 +1759,8 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         payload = {
             "username": {"value": email, "kind": "email"},
             "screen_hint": screen_hint,
@@ -1791,12 +1816,17 @@ class AuthFlow:
                 logger.info("注册邮箱已提交")
                 return True
 
-            # 已有账号 OTP 分支
+            # OTP 验证分支（passwordless 新注册 或 已有账号登录）
             if page_type == "email_otp_verification":
-                self._existing_email_verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+                mode = (payload.get("email_verification_mode", "") or "").strip()
+                self._existing_email_verification_mode = mode
                 self._existing_page_type = page_type
-                logger.info("检测到已有账号，切换到 OTP 登录流程")
-                self._is_existing_account = True
+                if mode == "passwordless_signup":
+                    logger.info("服务端选择 passwordless 注册流程（新账号，无密码），等待 OTP")
+                    self._is_existing_account = False
+                else:
+                    logger.info("检测到已有账号，切换到 OTP 登录流程")
+                    self._is_existing_account = True
                 return False
 
             # 未知 page_type：通常是社交登录/风控分支，按已有账号处理，避免误进 register_password 导致 invalid_state
@@ -1820,9 +1850,7 @@ class AuthFlow:
     # ── Step 6.5: 注册密码 ──
     def register_password(self, email: str) -> bool:
         logger.info("[5.5/10] 注册密码...")
-        # 按需求：密码默认使用注册邮箱，去掉 '@'
-        # 例如: abc123@example.com -> abc123example.com
-        password = self._default_password_from_email(email)
+        password = self._random_password()
         self.result.password = password
 
         # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
@@ -1840,11 +1868,14 @@ class AuthFlow:
         if self.result.device_id:
             try:
                 from sentinel import get_sentinel_token as _get_st
-                token = _get_st(self.session, device_id=self.result.device_id,
+                token, so_token = _get_st(self.session, device_id=self.result.device_id,
                                 flow="username_password_create",
                                 **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
+                self._last_sentinel_so_token = so_token or ""
                 logger.debug("Sentinel Token 获取成功")
+            except RuntimeError:
+                raise
             except Exception as e:
                 logger.warning(f"注册前刷新 sentinel 失败: {e}")
 
@@ -1852,6 +1883,8 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/user/register",
             headers=headers,
@@ -1871,6 +1904,8 @@ class AuthFlow:
         headers = self._common_headers(referer)
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         # zhuce6 用 GET /api/accounts/email-otp/send
         resp = self.session.get(
             "https://auth.openai.com/api/accounts/email-otp/send",
@@ -1890,6 +1925,8 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/passwordless/send-otp",
             headers=headers,
@@ -1911,6 +1948,8 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/email-otp/resend",
             headers=headers,
@@ -1975,12 +2014,33 @@ class AuthFlow:
             pwd = f"{pwd}2026OpenAI"
         return pwd
 
+    @staticmethod
+    def _random_password(length: int = 16) -> str:
+        import string
+        upper = string.ascii_uppercase
+        lower = string.ascii_lowercase
+        digits = string.digits
+        special = "!@#$%^&*"
+        must = [
+            random.choice(upper),
+            random.choice(lower),
+            random.choice(digits),
+            random.choice(special),
+        ]
+        all_chars = upper + lower + digits + special
+        rest = random.choices(all_chars, k=length - len(must))
+        pwd_list = must + rest
+        random.shuffle(pwd_list)
+        return "".join(pwd_list)
+
     def login_password_verify(self, password: str) -> dict:
         """已有账号密码登录一步（/password/verify）。"""
         headers = self._common_headers("https://auth.openai.com/log-in/password")
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/password/verify",
             headers=headers,
@@ -2025,17 +2085,22 @@ class AuthFlow:
         if self.result.device_id:
             try:
                 from sentinel import get_sentinel_token as _get_st
-                token = _get_st(self.session, device_id=self.result.device_id,
-                                flow="create_account",
+                token, so_token = _get_st(self.session, device_id=self.result.device_id,
+                                flow="oauth_create_account",
                                 **self._sentinel_fp_kwargs())
                 self._last_sentinel_token = token or ""
+                self._last_sentinel_so_token = so_token or ""
                 logger.debug("Sentinel Token 获取成功")
+            except RuntimeError:
+                raise
             except Exception as e:
                 logger.warning(f"创建账户前刷新 sentinel 失败: {e}")
         headers = self._common_headers("https://auth.openai.com/about-you")
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        if getattr(self, "_last_sentinel_so_token", ""):
+            headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
         _FIRST = ["James", "John", "Robert", "Michael", "William", "David", "Richard",
                   "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda",
                   "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen"]
@@ -2239,17 +2304,19 @@ class AuthFlow:
         current_url = start_url
         callback_url = ""
         max_hops = 12
+        referer = "https://auth.openai.com/"
 
         for i in range(max_hops):
             headers = {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://chatgpt.com/",
-                "User-Agent": self._common_headers()["User-Agent"],
+                "Referer": referer,
+                "User-Agent": self._ua,
             }
             resp = self.session.get(
                 current_url, headers=headers, timeout=30, allow_redirects=False
             )
             self._trace_http(f"redirect_hop_{i+1}", resp)
+            referer = current_url
 
             if "/api/auth/callback/openai" in current_url:
                 callback_url = current_url
@@ -2630,7 +2697,7 @@ class AuthFlow:
                     headers={
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Referer": "https://chatgpt.com/",
-                        "User-Agent": self._common_headers()["User-Agent"],
+                        "User-Agent": self._ua,
                     },
                     timeout=30,
                     allow_redirects=False,
@@ -2665,6 +2732,7 @@ class AuthFlow:
         # 检查网络
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
+        self.warmup()
 
         # 创建邮箱
         email = mail_provider.create_mailbox()
@@ -2672,7 +2740,7 @@ class AuthFlow:
 
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
+        auth_url = self.get_auth_url(csrf_token, email=email)
         device_id = self.auth_oauth_init(auth_url)
         sentinel = self.get_sentinel_token(device_id)
         is_new = self.signup(email, sentinel)
@@ -2707,26 +2775,18 @@ class AuthFlow:
                 )
 
         if is_new:
-            # 新账号：注册密码 → 发 OTP → 验证 → 创建账户
+            # 新账号：注册密码 → 等服务端自动发码 → 验证 OTP → 创建账户
+            # signin 时已带 login_hint，服务端会自动发码，无需主动 send_otp
             password_registered = self.register_password(email)
-            otp_sent_at = time.time()
-            if password_registered:
-                try:
-                    self.send_otp()
-                except RuntimeError as e:
-                    # 部分账号会在 register 后直接转入 email-verification，send 接口会报 invalid_auth_step
-                    if "invalid_auth_step" in str(e).lower():
-                        logger.warning("send_otp 返回 invalid_auth_step，回退到统一发码策略")
-                        if not self.kickoff_otp_delivery("register_password_invalid_auth_step"):
-                            raise
-                    else:
-                        raise
-            else:
-                # 注册密码失败时优先按“已有账号 OTP”回退，避免卡死在 invalid_auth_step
+            # 向前偏移 8 秒，覆盖 signin 阶段服务端自动发码的时间窗口
+            otp_sent_at = time.time() - 8
+            if not password_registered:
                 logger.warning("注册密码失败，回退到已有账号 OTP 路径")
                 self.fetch_client_auth_session_dump("post_register_password_failed_new")
+                # 密码注册失败时 fallback 主动发码
                 if not self.kickoff_otp_delivery("register_password_failed_fallback"):
                     self.send_otp()
+                otp_sent_at = time.time()
 
             try:
                 otp_timeout = max(10, int(os.getenv("OTP_TIMEOUT", "60")))
@@ -2979,6 +3039,7 @@ class AuthFlow:
 
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试登录链路以获取精确错误...")
+        self.warmup()
 
         # run_protocol_login 的语义即"登录已有账号"（docstring 明写）。kickoff_otp_delivery
         # 依据 _is_existing_account 选 resend vs send_passwordless_otp 分支；落到 send
@@ -2994,7 +3055,7 @@ class AuthFlow:
         self.result.password = login_password
 
         csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token)
+        auth_url = self.get_auth_url(csrf_token, email=email)
         device_id = self.auth_oauth_init(auth_url)
         sentinel = self.get_sentinel_token(device_id)
 

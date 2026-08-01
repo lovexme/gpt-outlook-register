@@ -53,12 +53,20 @@ def _quickjs_script_path() -> Path:
     return Path(__file__).resolve().parent / "openai_sentinel_quickjs.js"
 
 
+_sdk_file_cache: Optional[Path] = None
+
+
 def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
     """Download OpenAI's actual sdk.js to /tmp cache (one-shot per version)."""
+    global _sdk_file_cache
+    if _sdk_file_cache and _sdk_file_cache.exists():
+        return _sdk_file_cache
+
     cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / SENTINEL_VERSION
     cache_dir.mkdir(parents=True, exist_ok=True)
     sdk_file = cache_dir / "sdk.js"
     if sdk_file.exists() and sdk_file.stat().st_size > 0:
+        _sdk_file_cache = sdk_file
         return sdk_file
 
     resp = session.get(
@@ -79,49 +87,8 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
     if not content:
         raise RuntimeError("下载 sdk.js 失败: 响应为空")
     sdk_file.write_bytes(content)
+    _sdk_file_cache = sdk_file
     return sdk_file
-
-
-_WRAPPER_JS = """
-const fs = require('fs');
-const timeoutMs = Number(process.env.OPENAI_SENTINEL_VM_TIMEOUT_MS || '10000');
-const sdkFile = process.env.OPENAI_SENTINEL_SDK_FILE;
-const scriptFile = process.env.OPENAI_SENTINEL_QUICKJS_SCRIPT;
-
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => { input += chunk; });
-process.stdin.on('end', async () => {
-  try {
-    const payload = JSON.parse(input || '{}');
-    globalThis.__payload_json = JSON.stringify(payload);
-    globalThis.__sdk_source = fs.readFileSync(sdkFile, 'utf8');
-    globalThis.__vm_done = false;
-    globalThis.__vm_output_json = '';
-    globalThis.__vm_error = '';
-    const script = fs.readFileSync(scriptFile, 'utf8');
-    eval(script);
-
-    const started = Date.now();
-    while (!globalThis.__vm_done) {
-      if ((Date.now() - started) > timeoutMs) {
-        throw new Error('QuickJS script timeout');
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-
-    if (String(globalThis.__vm_error || '').trim()) {
-      throw new Error(String(globalThis.__vm_error));
-    }
-
-    process.stdout.write(String(globalThis.__vm_output_json || ''));
-  } catch (err) {
-    const msg = err && err.stack ? String(err.stack) : String(err);
-    process.stderr.write(msg);
-    process.exit(1);
-  }
-});
-""".strip()
 
 
 def _run_quickjs_action(
@@ -135,7 +102,7 @@ def _run_quickjs_action(
     body = dict(payload)
     body["action"] = action
     proc = subprocess.run(
-        [_resolve_node_binary(), "-e", _WRAPPER_JS],
+        [_resolve_node_binary(), str(quickjs_script)],
         input=json.dumps(body, ensure_ascii=False),
         text=True,
         capture_output=True,
@@ -143,8 +110,6 @@ def _run_quickjs_action(
         env={
             **os.environ,
             "OPENAI_SENTINEL_SDK_FILE": str(sdk_file),
-            "OPENAI_SENTINEL_QUICKJS_SCRIPT": str(quickjs_script),
-            "OPENAI_SENTINEL_VM_TIMEOUT_MS": str(min(timeout_ms, 30000)),
         },
     )
     if proc.returncode != 0:
@@ -216,7 +181,7 @@ def get_sentinel_token_via_quickjs(
     sec_ch_ua_bitness: str = "",
     sec_ch_ua_model: str = "",
     sec_ch_ua_platform_version: str = "",
-) -> Optional[str]:
+) -> Optional[tuple[str, str]]:
     """Try the QuickJS path. Return JSON string on success, None on any failure.
 
     Caller is expected to fall back to pure-Python sentinel on None.
@@ -312,6 +277,8 @@ def get_sentinel_token_via_quickjs(
         solve_payload.update({
             "request_p": request_p,
             "challenge": challenge,
+            "flow": flow,
+            "behavior_duration_ms": 4200,
         })
         solved = _run_quickjs_action(
             action="solve",
@@ -320,24 +287,18 @@ def get_sentinel_token_via_quickjs(
             payload=solve_payload,
             timeout_ms=timeout_ms,
         )
-        final_p = str(solved.get("final_p") or solved.get("p") or "").strip()
-        if not final_p:
-            log("Sentinel QuickJS 失败: solve 未返回 final_p")
-            return None
 
-        t_raw = solved.get("t")
-        t_value = "" if t_raw is None else str(t_raw).strip()
-        if not t_value:
-            log("Sentinel QuickJS 失败: solve 未返回有效 t")
-            return None
+        so_token_raw = str(solved.get("so_token") or "").strip()
 
-        token = json.dumps(
-            {"p": final_p, "t": t_value, "c": c_value, "id": did, "flow": flow},
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        log(f"Sentinel QuickJS OK (len={len(token)})")
-        return token
+        sdk_token = str(solved.get("token") or "").strip()
+        if sdk_token and so_token_raw:
+            log(f"Sentinel QuickJS OK (len={len(sdk_token)}, so=Y)")
+            return (sdk_token, so_token_raw)
+        if sdk_token:
+            log("Sentinel QuickJS 失败: 主 token 有但 SO token 为空，中止以避免封号")
+        else:
+            log("Sentinel QuickJS 失败: SDK token 为空，中止以避免封号")
+        return None
     except Exception as e:
         log(f"Sentinel QuickJS 异常: {e}")
         return None
