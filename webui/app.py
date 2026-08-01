@@ -148,6 +148,67 @@ def api_stats():
     return {"ok": True, "stats": db.stats()}
 
 
+# ──────────────────────── 代理连通性测试 ────────────────────────
+
+
+class ProxyTestReq(BaseModel):
+    proxies: list[str] = Field(..., description="要测试的代理列表")
+    timeout: int = Field(8, description="每个代理超时秒数")
+    test_url: str = Field("https://api.ipify.org?format=json",
+                          description="测试目标 URL（默认返回出口 IP）")
+
+
+@app.post("/api/proxy/test")
+def api_proxy_test(req: ProxyTestReq):
+    """并发测试代理连通性。复用真实注册流程的 create_http_session（含 socks5->socks5h
+    标准化、trust_env=False），保证「测试正常」== 「跑号能用」。返回 ok / 延迟 / 出口 IP。
+
+    协议说明：不写协议的 `ip:port` 被 curl 按 HTTP 代理处理；SOCKS5 需显式写 socks5://。
+    """
+    import sys as _sys
+    ROOT_DIR = Path(__file__).resolve().parents[1]
+    if str(ROOT_DIR) not in _sys.path:
+        _sys.path.insert(0, str(ROOT_DIR))
+    try:
+        from http_client import create_http_session
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"加载 http_client 失败: {e}")
+
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor
+
+    timeout = max(1, min(int(req.timeout or 8), 60))
+    test_url = (req.test_url or "https://api.ipify.org?format=json").strip()
+
+    proxies = [p.strip() for p in (req.proxies or []) if p and p.strip()]
+    if not proxies:
+        raise HTTPException(400, "proxies 不能为空")
+
+    def _test_one(proxy: str):
+        t0 = _t.perf_counter()
+        try:
+            sess = create_http_session(proxy=proxy)
+            resp = sess.get(test_url, timeout=timeout)
+            latency = int((_t.perf_counter() - t0) * 1000)
+            if resp.status_code != 200:
+                return {"ok": False, "latency_ms": latency, "error": f"HTTP {resp.status_code}"}
+            ip = ""
+            try:
+                ip = resp.json().get("ip", "")
+            except Exception:
+                ip = (resp.text or "").strip()[:64]
+            return {"ok": True, "latency_ms": latency, "ip": ip}
+        except Exception as e:  # noqa: BLE001
+            latency = int((_t.perf_counter() - t0) * 1000)
+            return {"ok": False, "latency_ms": latency, "error": str(e)[:140]}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(20, len(proxies))) as ex:
+        for proxy, res in zip(proxies, ex.map(_test_one, proxies)):
+            results[proxy] = res
+    return {"ok": True, "results": results}
+
+
 @app.post("/api/register")
 def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
