@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import queue
 import sys
 import threading
@@ -20,8 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]  # gpt-outlook-register/
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402
-from mail_outlook import OutlookMailProvider  # noqa: E402
 from auth_flow import AuthFlow  # noqa: E402
+from mail_providers import (  # noqa: E402
+    MailProviderError,
+    create_mail_provider,
+    get_provider_class,
+)
 from sms_provider import PhoneCallbackController  # noqa: E402
 
 from . import db  # noqa: E402
@@ -30,12 +33,26 @@ from . import db  # noqa: E402
 _run_queues: dict[str, queue.Queue] = {}
 _lock = threading.Lock()
 
+# 当前线程正在跑哪个 run。
+# ⚠️ 为什么需要这个：QueueLogHandler 是挂在 **root logger** 上的，而 root logger
+#    是进程全局的。auto_loop 并发时 N 个 run 各挂一个 handler，每条日志会被
+#    广播进**所有** run 的文件和 SSE 流 —— 实测 2026-08-04 三 worker 并发，
+#    一个号的记录同时出现在 3 个 .log 里，WebUI 上三个号的日志搅在一起，
+#    而 "[4/10] 获取 Sentinel Token..." 这类行不带邮箱，根本分不清是谁的。
+#
+#    注册链路（auth_flow / mail_providers / sentinel）内部不开任何线程，
+#    一个 run 的日志全在自己那条线程上产生，所以线程绑定就能干净切开。
+_current_run = threading.local()
+
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class QueueLogHandler(logging.Handler):
-    """把 logging 记录扔进 run queue + 写 log 文件。"""
+    """把 logging 记录扔进 run queue + 写 log 文件。
+
+    只收**本 run 线程**产生的日志，见 emit 里的过滤。
+    """
 
     def __init__(self, run_id: str, log_file: Path):
         super().__init__()
@@ -48,6 +65,14 @@ class QueueLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         try:
+            # emit 是在**打日志的那条线程**里同步跑的，所以这里读到的就是
+            # 日志产生者的 run_id。别人 run 的日志直接丢掉。
+            rid = getattr(_current_run, "run_id", None)
+            if rid is not None and rid != self.run_id:
+                return
+            # rid is None = 不属于任何 run（webui 请求线程、启动期日志等）。
+            # 这类照旧广播给所有 handler —— 宁可多收也不能丢，日志文件
+            # 开头那句 "webui: [run] xxx -> email@..." 就是这么来的。
             msg = self.format(record)
             self._fh.write(msg + "\n")
             self._fh.flush()
@@ -91,17 +116,35 @@ _NETWORK_ERROR_PATTERNS = [
 ]
 
 
-def classify_error(err: str) -> str:
-    """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。"""
+def classify_error(err: str, mail_source: str = "") -> str:
+    """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。
+
+    mail_source 用来问 provider 要不要豁免某些模式 —— 比如 iCloud 中转号
+    本来就是买的老号，"已有账号"是正常流程不是失败（见
+    MailProvider.accepts_existing_account）。留空则按最严格的规则判。
+    """
     s = (err or "").lower()
-    # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
-    if any(p in s for p in (
+
+    account_patterns = [
         "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
         "outlook imap account unusable", "user is authenticated but not connected",
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
-    )):
+    ]
+    if mail_source:
+        try:
+            exempt = get_provider_class(mail_source).accepts_existing_account
+        except MailProviderError:
+            exempt = False  # 未知来源 —— 按默认最严格规则走
+        # ⚠️ 用 if-in 而不是裸 remove()：上面的模式表将来被人改动/重排后，
+        #    remove 抛的 ValueError 会跟 get_provider_class 的错混在同一个
+        #    except 里被一起吞掉，豁免静默失效且没人看得出来。
+        if exempt and "已有账号" in account_patterns:
+            account_patterns.remove("已有账号")
+
+    # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
+    if any(p in s for p in account_patterns):
         return "account"
     if any(p in s for p in _NETWORK_ERROR_PATTERNS):
         return "network"
@@ -124,6 +167,10 @@ def _do_register(
         otp_timeout: int
         allow_existing_login: bool
     """
+    # 先认领本线程，再挂 handler —— 顺序不能反：中间要是有日志产生，
+    # 没打标记的话会被广播到其他并发 run 的日志里去。
+    _current_run.run_id = run_id
+
     handler = QueueLogHandler(run_id, log_file)
     handler.setLevel(logging.INFO)
     root_logger = logging.getLogger()
@@ -133,12 +180,22 @@ def _do_register(
         root_logger.setLevel(logging.INFO)
 
     email = account["email"]
-    saved_env = {}
     # 提前读取，避免在 try 块前异常时 except 引用未定义
     mail_source = db.get_setting("mail_source", "outlook")
+    # 要不要操作号池（mark_done / mark_failed / release）由 provider 声明的
+    # pooled 决定。未知 kind 时保守当池化处理 —— 号池里真有这行的话
+    # 至少不会漏掉状态回写，把号永远卡在 in_use。
+    try:
+        is_pooled = get_provider_class(mail_source).pooled
+    except MailProviderError:
+        is_pooled = True
 
     try:
-        # 注入环境变量（不污染全局，跑完恢复）
+        # 本次注册专属的配置覆盖。
+        # ⚠️ 以前是写 os.environ + finally 还原，但 auto_loop 并发跑多个 worker，
+        #    os.environ 是**进程全局**的：A 设的 OTP_TIMEOUT/WEBUI_ALLOW_LOGIN 会被
+        #    B 读到，B 跑完还原成 A 之前的值，A 后半程就用上别人的配置了。
+        #    现在整个 dict 直接传给 AuthFlow，只挂在实例上，谁都污染不到谁。
         env_overrides = {}
         # outlook 接码邮箱常被 OpenAI 走 passwordless_signup 流程（新号收码而非设密码），
         # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
@@ -151,43 +208,23 @@ def _do_register(
             env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
             env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
         # PROXY 走 cfg.proxy，无需 env
-        for k, v in env_overrides.items():
-            saved_env[k] = os.environ.get(k)
-            os.environ[k] = v
 
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
-        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all ─
-        if mail_source == "cf_temp":
-            sys_path_root = str(ROOT)
-            if sys_path_root not in sys.path:
-                sys.path.insert(0, sys_path_root)
-            from mail_cf import CFTempEmailProvider
+        # ─ 邮箱来源路由 ─
+        # 原来是 if cf_temp / else outlook 的写死分支，加一种邮箱就得回来改。
+        # 现在交给注册表工厂：provider 自己从 settings + account 里取需要的字段。
+        mail = create_mail_provider(mail_source, db.get_mail_settings(), account)
+        logging.getLogger("registrar").info(
+            f"[register] 邮箱来源: {mail_source} ({mail.display_name})"
+        )
 
-            api_url = db.get_setting("cf_api_url", "")
-            domain  = db.get_setting("cf_domain", "")
-            token   = db.get_cf_admin_token()
-            if not api_url or not domain or not token:
-                raise RuntimeError(
-                    "CF Temp Email 未配置完整（缺 api_url / domain / admin_token），"
-                    "请去「邮箱配置」Tab 填写"
-                )
-            mail = CFTempEmailProvider(
-                api_url=api_url, admin_token=token, domain=domain,
-            )
-            logging.getLogger("registrar").info(
-                f"[register] 邮箱来源: cf_temp / domain={domain}"
-            )
-        else:
-            mail = OutlookMailProvider(
-                email=account["email"],
-                password=account.get("password", ""),
-                client_id=account["client_id"],
-                refresh_token=account["refresh_token"],
-            )
-
-        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id))
+        flow = AuthFlow(
+            cfg,
+            sms_callback=_build_sms_callback(run_id),
+            env_overrides=env_overrides,
+        )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
 
@@ -240,8 +277,9 @@ def _do_register(
 
         # 落库
         db.save_registered(d)
-        # CF 模式下 email 是虚拟占位（cf_placeholder_XXX@cf.local），不操作号池
-        if mail_source != "cf_temp":
+        # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
+        # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
+        if is_pooled:
             db.mark_done(email)
 
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
@@ -265,12 +303,12 @@ def _do_register(
 
     except Exception as e:
         err = str(e)
-        category = classify_error(err)
+        category = classify_error(err, mail_source)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         if category != "account":
             logging.getLogger("registrar").error(traceback.format_exc())
-        # CF 模式下不操作号池
-        if mail_source != "cf_temp":
+        # 非池化 provider 没有号池记录，不操作
+        if is_pooled:
             if category == "network":
                 db.release_unused(email)
                 logging.getLogger("registrar").warning(
@@ -282,12 +320,7 @@ def _do_register(
         _emit_status(run_id, "error", {"message": err, "category": category})
 
     finally:
-        # 还原 env
-        for k, v in saved_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        # env 覆盖现在只挂在 AuthFlow 实例上，随实例一起回收，无需还原。
         # 关闭 handler
         try:
             root_logger.removeHandler(handler)
@@ -297,6 +330,10 @@ def _do_register(
         q = _run_queues.get(run_id)
         if q is not None:
             q.put(None)  # sentinel: 流结束
+        # 线程标记清掉。理论上线程跑完就回收了，但 threading.local 是绑在
+        # 线程对象上的，万一以后换成线程池复用线程，残留的 run_id 会让下一个
+        # 任务的日志全被投递到上一个 run 的（已关闭的）文件里去。
+        _current_run.run_id = None
 
 
 def _try_export_to_panels(run_id: str, cred: dict) -> None:

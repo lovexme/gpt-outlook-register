@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 from . import db, registrar
+from mail_providers import MailProviderError, get_provider_class
 
 logger = logging.getLogger("auto_loop")
 
@@ -320,15 +321,24 @@ class AutoLoopController:
                     )
                     return
 
-            # claim 下一个号（CF 模式用虚拟占位，无需 outlook 号池）
+            # claim 下一个号。要不要走号池由 provider 的 pooled 决定，
+            # 非池化的（CF 这类自己造地址的）用虚拟占位。
             mail_source = db.get_setting("mail_source", "outlook")
-            if mail_source == "cf_temp":
-                account = {
-                    "email": f"cf_placeholder_{int(time.time())}_{worker_id}@cf.local",
-                    "password": "", "client_id": "", "refresh_token": "",
-                }
+            try:
+                pooled = get_provider_class(mail_source).pooled
+            except MailProviderError as e:
+                logger.error(f"[worker-{worker_id}] {e}，停止")
+                self._set_message(str(e))
+                return
+            if pooled:
+                account = db.claim_next(kind=mail_source)
             else:
-                account = db.claim_next()
+                account = {
+                    "email": f"{mail_source}_placeholder_"
+                             f"{int(time.time())}_{worker_id}@placeholder.local",
+                    "password": "", "client_id": "", "refresh_token": "",
+                    "relay_url": "", "kind": mail_source,
+                }
             if not account:
                 idle_round += 1
                 if idle_round == 1:
@@ -357,7 +367,7 @@ class AutoLoopController:
                 run_id = registrar.start_registration(account, run_options)
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
-                if mail_source != "cf_temp":
+                if pooled:
                     db.release_unused(account["email"])
                 time.sleep(2)
                 continue
