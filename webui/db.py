@@ -22,6 +22,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -33,11 +34,19 @@ DB_PATH = Path(__file__).resolve().parent / "webui.db"
 
 _lock = threading.Lock()  # SQLite 写入串行化
 
+# 2026-09-16 修复：thread-local 单连接复用，防 fd 泄漏
+# （原实现每次 _conn() 新建连接从不 close，WAL 下每连接 2 fd，
+#   auto_loop 每秒轮询 × 多 worker 几十秒撞满 1024 → 进程假死）
+_con_local = threading.local()
+
 
 def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
+    con = getattr(_con_local, "con", None)
+    if con is None:
+        con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        _con_local.con = con
     return con
 
 
@@ -57,7 +66,8 @@ def init_db():
             imported_at     REAL,
             claimed_at      REAL,
             finished_at     REAL,
-            fail_reason     TEXT
+            fail_reason     TEXT,
+            claim_token     TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
@@ -127,11 +137,48 @@ def init_db():
     if "relay_url" not in acc_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
         con.commit()
+    if "claim_token" not in acc_cols:
+        con.execute("ALTER TABLE outlook_accounts ADD COLUMN claim_token TEXT")
+        con.commit()
     # 索引建在补列之后，否则老库上 CREATE INDEX 会因为没有 kind 列而失败
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_outlook_kind ON outlook_accounts(kind, status)"
     )
     con.commit()
+
+
+def list_credentialed() -> list[dict]:
+    """返回所有有 access_token 的 registered 记录，用于定时检测。"""
+    con = _conn()
+    cur = con.execute(
+        "SELECT email, access_token FROM registered WHERE length(access_token) > 0"
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def list_credentialed_filtered(filter_rt: str = "all", search: str = "") -> list[dict]:
+    """返回当前注册结果筛选条件下、具备 AT 的账号，用于手动批量状态检测。"""
+    con = _conn()
+    where = _registered_where(filter_rt, search)
+    at_clause = "coalesce(length(access_token), 0) > 0"
+    where = f"{where} AND {at_clause}" if where else f"WHERE {at_clause}"
+    cur = con.execute(
+        f"SELECT email, access_token FROM registered {where} ORDER BY created_at DESC"
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def clear_credentials(email: str) -> None:
+    """清除 access_token / session_token / refresh_token，保留注册记录。"""
+    email = email.lower()
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE registered SET access_token='', session_token='', refresh_token='' "
+            "WHERE email=?",
+            (email,),
+        )
+        con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -282,15 +329,18 @@ def claim_account(email: str) -> Optional[dict]:
         row = cur.fetchone()
         if not row:
             return None
+        token = uuid.uuid4().hex
         rc = con.execute(
-            "UPDATE outlook_accounts SET status='in_use', claimed_at=?, fail_reason=NULL "
+            "UPDATE outlook_accounts SET status='in_use', claimed_at=?, fail_reason=NULL, claim_token=? "
             "WHERE email=? AND status IN ('available', 'failed')",
-            (time.time(), email),
+            (time.time(), token, email),
         )
         con.commit()
         if rc.rowcount != 1:
             return None
-        return dict(row)
+        result = dict(row)
+        result["claim_token"] = token
+        return result
 
 
 def claim_next(kind: str = "") -> Optional[dict]:
@@ -320,48 +370,59 @@ def claim_next(kind: str = "") -> Optional[dict]:
             row = cur.fetchone()
             if not row:
                 return None
+            token = uuid.uuid4().hex
             rc = con.execute(
-                "UPDATE outlook_accounts SET status='in_use', claimed_at=? "
+                "UPDATE outlook_accounts SET status='in_use', claimed_at=?, claim_token=? "
                 "WHERE email=? AND status='available'",
-                (time.time(), row["email"]),
+                (time.time(), token, row["email"]),
             )
             con.commit()
             if rc.rowcount == 1:
-                return dict(row)
+                result = dict(row)
+                result["claim_token"] = token
+                return result
             # 被别的线程抢走了，换下一个再试
         return None
 
 
-def mark_done(email: str) -> None:
+def mark_done(email: str, claim_token: Optional[str] = None) -> bool:
     with _lock:
         con = _conn()
-        con.execute(
-            "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=?",
-            (time.time(), email.lower()),
-        )
+        sql = "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=? AND status='in_use'"
+        args = [time.time(), email.lower()]
+        if claim_token is not None:
+            sql += " AND claim_token=?"
+            args.append(claim_token)
+        rc = con.execute(sql, args)
         con.commit()
+        return rc.rowcount > 0
 
 
-def mark_failed(email: str, reason: str = "") -> None:
+def mark_failed(email: str, reason: str = "", claim_token: Optional[str] = None) -> bool:
     with _lock:
         con = _conn()
-        con.execute(
-            "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? WHERE email=?",
-            (time.time(), (reason or "")[:500], email.lower()),
-        )
+        sql = "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? WHERE email=? AND status='in_use'"
+        args = [time.time(), (reason or "")[:500], email.lower()]
+        if claim_token is not None:
+            sql += " AND claim_token=?"
+            args.append(claim_token)
+        rc = con.execute(sql, args)
         con.commit()
+        return rc.rowcount > 0
 
 
-def release_unused(email: str) -> None:
+def release_unused(email: str, claim_token: Optional[str] = None) -> bool:
     """claim 后没真注册（异常 / 用户取消）→ 还回 available。"""
     with _lock:
         con = _conn()
-        con.execute(
-            "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
-            "WHERE email=? AND status='in_use'",
-            (email.lower(),),
-        )
+        sql = "UPDATE outlook_accounts SET status='available', claimed_at=NULL, claim_token=NULL WHERE email=? AND status='in_use'"
+        args = [email.lower()]
+        if claim_token is not None:
+            sql += " AND claim_token=?"
+            args.append(claim_token)
+        rc = con.execute(sql, args)
         con.commit()
+        return rc.rowcount > 0
 
 
 def reset_to_available(email: str) -> bool:
@@ -620,11 +681,7 @@ def get_detailed_stats() -> dict:
 
 
 def save_registered(d: dict) -> None:
-    """保存注册成功（或部分成功）的凭证。覆盖同邮箱旧记录。
-
-    凭证三件套（access_token / session_token / refresh_token）单独存列；
-    其余字段（如 device_id / cookie_header / id_token / 自定义元数据）打包进 extra_json。
-    """
+    """保存注册成功（或部分成功）的凭证。覆盖同邮箱旧记录。"""
     email = (d.get("email") or "").lower()
     if not email:
         return
@@ -635,37 +692,44 @@ def save_registered(d: dict) -> None:
     }}
     with _lock:
         con = _conn()
-        # ⚠️ INSERT OR REPLACE 是**整行替换**，不是按字段合并 —— 没写的列会被清空。
-        #    重跑同一个邮箱时这会咬人：第一轮 register_password 设了密码但 OTP 超时，
-        #    save_password_early 把密码存下了；第二轮 OpenAI 已经认识这个邮箱了，
-        #    走 passwordless_login 分支根本不调 register_password，
-        #    这一轮的 d["password"] 是空的 —— 直接 REPLACE 就把上一轮的密码冲没了。
-        #    密码是 OpenAI 侧的**持久状态**，"这一轮没设" ≠ "这个号没有密码"，
-        #    所以空值不覆盖非空旧值。
-        #    token 三件套正相反：每轮跑都是全新的，旧的可能已失效，照常整列覆盖。
-        if not password:
-            row = con.execute(
-                "SELECT password FROM registered WHERE email=?", (email,)
-            ).fetchone()
-            if row and (row["password"] or "").strip():
-                password = row["password"]
+        existing_row = con.execute(
+            "SELECT password, access_token, session_token, refresh_token, id_token, "
+            "device_id, csrf_token, cookie_header, extra_json FROM registered WHERE email=?",
+            (email,),
+        ).fetchone()
+        if existing_row:
+            # 自动重跑返回空字段不代表应清空旧凭证；显式清理走 clear_credentials。
+            for key in (
+                "password", "access_token", "session_token", "refresh_token", "id_token",
+                "device_id", "csrf_token", "cookie_header",
+            ):
+                current = d.get(key) or ""
+                old = existing_row[key] or ""
+                if not current and old:
+                    if key == "password":
+                        password = old
+                    else:
+                        d[key] = old
+            existing_extra = {}
+            if existing_row["extra_json"]:
+                try:
+                    parsed = json.loads(existing_row["extra_json"])
+                    if isinstance(parsed, dict):
+                        existing_extra = parsed
+                except (TypeError, ValueError):
+                    pass
+            existing_extra.update(extra)
+            extra = existing_extra
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
             "id_token, device_id, csrf_token, cookie_header, extra_json, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                email,
-                password,
-                d.get("access_token", ""),
-                d.get("session_token", ""),
-                d.get("refresh_token", ""),
-                d.get("id_token", ""),
-                d.get("device_id", ""),
-                d.get("csrf_token", ""),
-                d.get("cookie_header", ""),
-                json.dumps(extra, ensure_ascii=False) if extra else None,
-                time.time(),
+                email, password, d.get("access_token", ""), d.get("session_token", ""),
+                d.get("refresh_token", ""), d.get("id_token", ""), d.get("device_id", ""),
+                d.get("csrf_token", ""), d.get("cookie_header", ""),
+                json.dumps(extra, ensure_ascii=False) if extra else None, time.time(),
             ),
         )
         con.commit()
@@ -709,21 +773,24 @@ def save_password_early(email: str, password: str) -> None:
 
 
 def update_plus_check(email: str, plus_info: dict) -> None:
-    """把 Plus 检查结果写入 extra_json.plus_check。"""
-    email = email.lower()
-    con = _conn()
-    cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
-    row = cur.fetchone()
-    if not row:
+    """把 Plus 检查结果原子合并写入 extra_json.plus_check。"""
+    email = (email or "").strip().lower()
+    if not email:
         return
-    extra = {}
-    if row["extra_json"]:
-        try:
-            extra = json.loads(row["extra_json"])
-        except Exception:
-            extra = {}
-    extra["plus_check"] = plus_info
     with _lock:
+        con = _conn()
+        row = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,)).fetchone()
+        if not row:
+            return
+        extra = {}
+        if row["extra_json"]:
+            try:
+                parsed = json.loads(row["extra_json"])
+                if isinstance(parsed, dict):
+                    extra = parsed
+            except (TypeError, ValueError):
+                pass
+        extra["plus_check"] = plus_info
         con.execute(
             "UPDATE registered SET extra_json=? WHERE email=?",
             (json.dumps(extra, ensure_ascii=False), email),
@@ -731,31 +798,81 @@ def update_plus_check(email: str, plus_info: dict) -> None:
         con.commit()
 
 
-def _registered_where(filt: str) -> str:
+def update_auth_tokens(
+    email: str,
+    access_token: str = "",
+    session_token: str = "",
+    refresh_token: str = "",
+    cookie_header: str = "",
+    device_id: str = "",
+    csrf_token: str = "",
+) -> None:
+    """只更新凭证列，不动 extra_json（保留 plus_check / exit_ip / totp_secret）。
+
+    开通 Plus 后 OpenAI 会轮换 access_token，旧 token 401 expired ——
+    刷新 AT 场景用这个函数回写新凭证，而不是 save_registered 整行 REPLACE。
+    """
+    email = email.lower()
+    with _lock:
+        con = _conn()
+        sets = []
+        vals = []
+        for col, val in [
+            ("access_token", access_token),
+            ("session_token", session_token),
+            ("refresh_token", refresh_token),
+            ("cookie_header", cookie_header),
+            ("device_id", device_id),
+            ("csrf_token", csrf_token),
+        ]:
+            if val:
+                sets.append(f"{col}=?")
+                vals.append(val)
+        if not sets:
+            return
+        vals.append(email)
+        con.execute(
+            f"UPDATE registered SET {', '.join(sets)} WHERE email=?",
+            vals,
+        )
+        con.commit()
+
+
+def _registered_where(filt: str, search: str = "") -> str:
+    where = ""
     if filt == "has_rt":
-        return "WHERE length(refresh_token) > 0"
-    if filt == "no_rt":
-        return "WHERE coalesce(length(refresh_token),0) = 0"
-    if filt == "unchecked":
-        return "WHERE (extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')"
-    if filt == "free":
-        return "WHERE extra_json LIKE '%\"free\"%'"
-    if filt == "plus":
-        return "WHERE (extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')"
-    if filt == "banned":
-        return "WHERE extra_json LIKE '%\"banned\"%'"
-    return ""
+        where = "WHERE length(refresh_token) > 0"
+    elif filt == "no_at":
+        where = "WHERE coalesce(length(access_token),0) = 0"
+    elif filt == "unchecked":
+        where = "WHERE (extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')"
+    elif filt == "active":
+        where = "WHERE json_extract(extra_json, '$.plus_check.status') LIKE '%_active'"
+    elif filt == "banned":
+        where = "WHERE json_extract(extra_json, '$.plus_check.status') = 'banned'"
+    elif filt in {"free", "plus", "pro", "team", "business", "enterprise", "go"}:
+        where = "WHERE (json_extract(extra_json, '$.plus_check.status') = '" + filt + "' " \
+                "OR json_extract(extra_json, '$.plus_check.status') LIKE '" + filt + "_%')"
+    search = (search or "").strip()
+    if search:
+        kw = search.replace("'", "''")
+        like = f"email LIKE '%{kw}%'"
+        if where:
+            where = where + " AND " + like
+        else:
+            where = "WHERE " + like
+    return where
 
 
-def count_registered(filter_rt: str = "all") -> int:
+def count_registered(filter_rt: str = "all", search: str = "") -> int:
     con = _conn()
-    cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt)}")
+    cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt, search)}")
     return cur.fetchone()[0]
 
 
-def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
+def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all", search: str = "") -> list[dict]:
     con = _conn()
-    where = _registered_where(filter_rt)
+    where = _registered_where(filter_rt, search)
     cur = con.execute(
         f"SELECT email, password, "
         f"length(access_token) AS at_len, length(session_token) AS st_len, "
@@ -767,13 +884,19 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
     for r in cur.fetchall():
         d = dict(r)
         plus = None
+        exit_ip = ""
+        totp_secret = ""
         if d.get("extra_json"):
             try:
                 extra = json.loads(d["extra_json"])
                 plus = extra.get("plus_check")
+                exit_ip = extra.get("exit_ip", "")
+                totp_secret = extra.get("totp_secret", "")
             except Exception:
                 pass
         d["plus_check"] = plus
+        d["exit_ip"] = exit_ip
+        d["totp_secret"] = totp_secret
         d.pop("extra_json", None)
         rows.append(d)
     return rows
@@ -850,6 +973,38 @@ def get_registered(email: str) -> Optional[dict]:
     return out
 
 
+
+def set_extra_json(email: str, extra_json: str) -> None:
+    """原子合并更新 registered.extra_json，保留并发写入的其它字段。"""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    try:
+        new_data = json.loads(extra_json)
+    except (TypeError, ValueError):
+        new_data = {}
+    if not isinstance(new_data, dict):
+        return
+    with _lock:
+        con = _conn()
+        row = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,)).fetchone()
+        if not row:
+            return
+        existing = {}
+        if row["extra_json"]:
+            try:
+                parsed = json.loads(row["extra_json"])
+                if isinstance(parsed, dict):
+                    existing = parsed
+            except (TypeError, ValueError):
+                pass
+        existing.update(new_data)
+        con.execute(
+            "UPDATE registered SET extra_json = ? WHERE email = ?",
+            (json.dumps(existing, ensure_ascii=False), email),
+        )
+        con.commit()
+
 def delete_registered(email: str) -> bool:
     with _lock:
         con = _conn()
@@ -868,6 +1023,34 @@ def delete_registered_by_emails(emails: list[str]) -> int:
         rc = con.execute(
             f"DELETE FROM registered WHERE email IN ({placeholders})",
             cleaned,
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def delete_registered_by_status(status: str) -> int:
+    """按 plus_check.status 批量删除。"""
+    with _lock:
+        con = _conn()
+        rows = con.execute("SELECT email, extra_json FROM registered").fetchall()
+        targets = []
+        for row in rows:
+            ej = row["extra_json"]
+            if not ej:
+                continue
+            try:
+                extra = json.loads(ej)
+            except Exception:
+                continue
+            pc = extra.get("plus_check") or {}
+            if pc.get("status") == status:
+                targets.append(row["email"])
+        if not targets:
+            return 0
+        placeholders = ",".join("?" * len(targets))
+        rc = con.execute(
+            f"DELETE FROM registered WHERE email IN ({placeholders})",
+            targets,
         )
         con.commit()
         return rc.rowcount
@@ -1049,10 +1232,53 @@ def get_proxy_pool() -> list[str]:
 
 
 def set_proxy_pool(proxies: list[str]) -> None:
-    """把代理池同步到后端 settings，供定时健康检查使用。
+    """更新完整代理配置池；健康检查负责维护当前生效池。"""
+    cleaned = [p.strip() for p in (proxies or []) if p and p.strip()]
+    with _lock:
+        con = _conn()
+        old_raw = con.execute("SELECT value FROM settings WHERE key='proxy_pool'").fetchone()
+        old = []
+        if old_raw:
+            try:
+                old = json.loads(old_raw[0]) or []
+            except Exception:
+                old = []
+        health_raw = con.execute("SELECT value FROM settings WHERE key='proxy_health'").fetchone()
+        health = {}
+        if health_raw:
+            try:
+                health = json.loads(health_raw[0]) or {}
+            except Exception:
+                health = {}
+        states = health.get("proxies", {}) if isinstance(health, dict) else {}
+        # 新代理先进入生效池，已知失败/禁用代理保持禁用，等待下一轮复查。
+        active = [
+            p for p in cleaned
+            if states.get(p, {}).get("ok", True)
+        ]
+        payload = json.dumps(cleaned, ensure_ascii=False)
+        active_payload = json.dumps(active, ensure_ascii=False)
+        con.execute("INSERT INTO settings(key,value) VALUES('proxy_pool_config',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (payload,))
+        con.execute("INSERT INTO settings(key,value) VALUES('proxy_pool',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (active_payload,))
+        con.commit()
 
-    前端代理修改后调用，保证后端定时任务测试的是「当前生效」的池。
-    """
+
+def get_proxy_config_pool() -> list[str]:
+    """读取完整配置池；兼容旧版本时从当前池惰性初始化。"""
+    raw = get_setting("proxy_pool_config", "")
+    if not raw:
+        raw = get_setting("proxy_pool", "")
+        if raw:
+            set_setting("proxy_pool_config", raw)
+    try:
+        data = json.loads(raw) if raw else []
+        return [p.strip() for p in data if isinstance(p, str) and p.strip()]
+    except Exception:
+        return []
+
+
+def set_active_proxy_pool(proxies: list[str]) -> None:
+    """只更新当前生效池，不改变完整配置池。"""
     cleaned = [p.strip() for p in (proxies or []) if p and p.strip()]
     set_setting("proxy_pool", json.dumps(cleaned, ensure_ascii=False))
 
@@ -1264,6 +1490,10 @@ def get_export_config() -> dict:
         "sub2api_api_key":    "***" if get_setting("export_sub2api_api_key") else "",
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        "c2a_enabled":         get_setting("export_c2a_enabled", "0"),
+        "c2a_url":             get_setting("export_c2a_url", "http://127.0.0.1:8059"),
+        "c2a_api_key":         "***" if get_setting("export_c2a_api_key") else "",
+        "c2a_timeout":         get_setting("export_c2a_timeout", "30"),
     }
 
 
@@ -1273,6 +1503,7 @@ def save_export_config(data: dict) -> None:
     for key_in, key_out in (
         ("cpa_enabled",     "export_cpa_enabled"),
         ("sub2api_enabled", "export_sub2api_enabled"),
+        ("c2a_enabled",     "export_c2a_enabled"),
     ):
         if key_in in data:
             v = data[key_in]
@@ -1288,6 +1519,8 @@ def save_export_config(data: dict) -> None:
         ("sub2api_url",        "export_sub2api_url"),
         ("sub2api_group_ids",  "export_sub2api_group_ids"),
         ("sub2api_timeout",    "export_sub2api_timeout"),
+        ("c2a_url",            "export_c2a_url"),
+        ("c2a_timeout",        "export_c2a_timeout"),
     ):
         if key_in in data:
             set_setting(key_out, str(data[key_in] or "").strip())
@@ -1296,12 +1529,15 @@ def save_export_config(data: dict) -> None:
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
     if data.get("sub2api_api_key") and data["sub2api_api_key"] != "***":
         set_setting("export_sub2api_api_key", str(data["sub2api_api_key"]).strip())
+    if data.get("c2a_api_key") and data["c2a_api_key"] != "***":
+        set_setting("export_c2a_api_key", str(data["c2a_api_key"]).strip())
+
 
 
 def get_export_internal_config() -> dict:
     """内部用：拿明文密钥 + 解析后的 enabled 布尔。供 registrar / app.test 调用。
 
-    返回两个子配置 dict，可分别传给 exporter.export_to_cpa / export_to_sub2api。
+    返回子配置 dict，可分别传给 exporter.export_to_cpa / export_to_sub2api。
     """
     cpa = {
         "enabled":      get_setting("export_cpa_enabled", "0") in ("1", "true"),
@@ -1316,7 +1552,13 @@ def get_export_internal_config() -> dict:
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
     }
-    return {"cpa": cpa, "sub2api": sub2api}
+    chatgpt2api = {
+        "enabled":       get_setting("export_c2a_enabled", "0") in ("1", "true"),
+        "c2a_url":       get_setting("export_c2a_url", "http://127.0.0.1:8059"),
+        "c2a_api_key":   get_setting("export_c2a_api_key", ""),
+        "c2a_timeout":   get_setting("export_c2a_timeout", "30"),
+    }
+    return {"cpa": cpa, "sub2api": sub2api, "chatgpt2api": chatgpt2api}
 
 
 # 模块加载时自动建表
