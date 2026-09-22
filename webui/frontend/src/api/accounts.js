@@ -2,6 +2,7 @@ import http from './request'
 
 // ──────────────── 统计 ────────────────
 export const getStats = () => http.get('/api/stats')
+export const getDetailedStats = () => http.get('/api/stats/detailed')
 
 // ──────────────── 号池 accounts ────────────────
 // kind = 邮箱来源（outlook / ...）。留空后端会按段数猜，
@@ -27,3 +28,6 @@ export const bulkResetAccounts = (emails) =>
   http.post('/api/accounts/bulk_reset', { emails })
 
 export const releaseStale = () => http.post('/api/accounts/release_stale')
+
+// ──────────────── 付款链接 ────────────────
+

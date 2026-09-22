@@ -1,0 +1,609 @@
+"""DDG @duck.com 私密地址 provider —— 面板接入 duck_pool 生成地址 + 绑定邮箱收信。
+
+注册链路：
+  create_mailbox() = 从 duck_pool 账号池取 access_token，POST /api/email/addresses
+                     生成 @duck.com 地址（转发目标是该 DDG 账号绑定的 CF/fmail 邮箱）
+  wait_for_otp()   = duck 地址邮件由 DDG 转发到绑定邮箱，按类型轮询收信：
+                     - rs-hub.com / 101122.xyz (CF worker) → /admin/mails
+                     - 其他 (fmail 集群) → fmail.men API
+
+依赖 duck_pool（/root/duck_pool/duck_pool.py）的 DDG API + CF 收信实现。
+首次用：先跑 `python3 /root/duck_pool/duck_pool.py register` 建账号池。
+"""
+from __future__ import annotations
+
+import json as _json
+import logging
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+from typing import Optional
+
+_DP = "/root/duck_pool"
+if _DP not in sys.path:
+    sys.path.insert(0, _DP)
+
+from .base import ConfigField, MailProvider, extract_otp, register
+
+logger = logging.getLogger(__name__)
+
+# 收信走 CF worker 的域（rs-hub.com = DDG 接受发信；101122.xyz 被 DDG 拒发但保留兼容旧账号）
+CF_DOMAINS = {"rs-hub.com", "101122.xyz"}
+
+# 生成地址的进程级锁：DDG 对同一 token 的并发 POST 会返回同一地址（缓存），
+# 并发注册时会导致多个任务共用一个 @duck.com 地址 → OTP 串扰 wrong code。
+# 串行化 create_mailbox + DB 去重双保险。
+_CREATE_LOCK = threading.Lock()
+# 账号轮换计数器：并发注册时轮换不同 DDG 账号/绑定邮箱，避免全挤最新账号
+_PICK_INDEX = [0]
+
+
+@register
+class DuckProvider(MailProvider):
+    """DuckDuckGo Email Protection 私密地址池。"""
+
+    kind = "duck"
+    display_name = "DDG @duck.com"
+    pooled = False          # 地址由 duck_pool 账号池即时生成
+    ephemeral = True        # 每次注册生成新地址 → OpenAI 当新号
+    line_segments = 0
+    import_hint = ""
+    import_placeholder = ""
+    config_fields = [
+        ConfigField(
+            "duck_proxy", "DDG API 出口代理",
+            placeholder="socks5h://127.0.0.1:1080",
+            help="生成 @duck.com 地址的出口（DDG 直连被墙；生成地址不耗注册配额）",
+        ),
+        ConfigField(
+            "duck_extract_url", "提号 URL（可选）",
+            placeholder="http://127.0.0.1:5910/api/extract",
+            help="留空=现场生成地址；填写 DDG 邮箱池提号接口后，注册时从池里提取已生成地址",
+        ),
+        ConfigField(
+            "duck_extract_token", "提号 Token", type="password",
+            help="DDG 邮箱池配置的 extract_token",
+        ),
+    ]
+
+    def __init__(self, proxy: str = "", extract_url: str = "", extract_token: str = ""):
+        self._proxy = proxy or "socks5h://127.0.0.1:1080"
+        self._extract_url = (extract_url or "").strip()
+        self._extract_token = (extract_token or "").strip()
+        self._email = ""
+        self._duck_user = ""
+        self._bind_email = ""
+        self._bind_kind = ""    # cf | outlook | tempmail | fmail
+        self._bind_credential = ""  # Temp-Mail Bearer token（其他来源为空）
+        self._seen = set()      # CF 邮件 id 已处理集合
+        self._fmail_seen = set()  # fmail token 已处理集合
+        self._s = None
+
+    @classmethod
+    def from_config(cls, settings: dict, account: Optional[dict] = None):
+        return cls(
+            proxy=(settings.get("duck_proxy") or "").strip(),
+            extract_url=(settings.get("duck_extract_url") or "").strip(),
+            extract_token=(settings.get("duck_extract_token") or "").strip(),
+        )
+
+    # ───────────── 工具 ─────────────
+
+    def _pick_account(self):
+        """从 duck_pool 库轮换取 DDG 账号（round-robin），返回 (username, access_token, bind_email)。
+
+        并发注册时每个任务取不同账号 → 绑定邮箱分散，避免 OTP 串扰。
+        """
+        import sqlite3
+        conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+        rows = conn.execute(
+            "SELECT username, access_token, email FROM accounts "
+            "WHERE access_token != '' ORDER BY created_at ASC").fetchall()
+        conn.close()
+        if not rows:
+            raise RuntimeError("duck_pool 账号池为空，先跑 /root/duck_pool/duck_pool.py register")
+        idx = _PICK_INDEX[0] % len(rows)
+        _PICK_INDEX[0] += 1
+        return rows[idx]
+
+    def _bind_meta(self, username: str, email: str) -> tuple[str, str]:
+        """以 duck_pool 持久化来源为准，不能再按域名把 Temp-Mail 误判为 fmail。"""
+        conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+        try:
+            row = conn.execute("SELECT source, credential FROM bind_mailboxes WHERE email=?", (email,)).fetchone()
+            if row:
+                return (row[0] or "fmail"), (row[1] or "")
+            row = conn.execute("SELECT mail_source FROM attempts WHERE username=? ORDER BY updated_at DESC LIMIT 1", (username,)).fetchone()
+            source = row[0] if row and row[0] else ("cf" if email.split("@")[-1].lower() in CF_DOMAINS else "fmail")
+            return source, ""
+        finally:
+            conn.close()
+
+    # ───────────── MailProvider 接口 ─────────────
+
+    def self_test(self) -> dict:
+        """面板「测试」按钮：生成一个 duck 地址验证 DDG API + 账号池。"""
+        try:
+            email = self.create_mailbox()
+            return {"ok": True, "message": f"连接成功，生成地址: {email}"}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def create_mailbox(self) -> str:
+        # 配置了提号 URL → 从 DDG 邮箱池提取已生成地址（已标记 extracted，不重复）
+        if self._extract_url:
+            return self._create_from_extract()
+        with _CREATE_LOCK:   # 串行化：防 DDG 并发返回重复地址
+            return self._create_mailbox_locked()
+
+    def _create_from_extract(self) -> str:
+        """从 DDG 邮箱池提号接口领取 1 个 @duck.com 地址（含绑定邮箱映射）。"""
+        import requests
+        try:
+            r = requests.get(self._extract_url,
+                             params={"count": 1, "token": self._extract_token},
+                             timeout=20)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"提号接口请求失败: {e}")
+        if r.status_code != 200:
+            raise RuntimeError(f"提号接口 HTTP {r.status_code}: {r.text[:200]}")
+        d = r.json()
+        items = d.get("extracted") or []
+        if not items:
+            raise RuntimeError("提号池为空（没有未提取地址，先去 DDG 邮箱池生成）")
+        self._email = items[0].get("address") or ""
+        self._duck_user = items[0].get("username") or ""
+        # 从 duck_pool 反查该账号的绑定邮箱
+        import sqlite3
+        conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+        row = conn.execute(
+            "SELECT email FROM accounts WHERE username=?", (self._duck_user,)).fetchone()
+        conn.close()
+        if not row:
+            raise RuntimeError(f"提号账号 {self._duck_user} 在池中无绑定邮箱")
+        self._bind_email = row[0]
+        self._bind_kind, self._bind_credential = self._bind_meta(self._duck_user, self._bind_email)
+        logger.info(f"[duck] 从池提取 {self._email} (账号 {self._duck_user}, 收信 {self._bind_email}, source={self._bind_kind})")
+        return self._email
+
+    def _create_mailbox_locked(self) -> str:
+        import duck_pool
+        last_err = ""
+        for _ in range(6):
+            user, at, bind = self._pick_account()
+            # DDG 生成私密地址（转发目标 = 账号绑定邮箱，无需新建邮箱）
+            http = duck_pool._HTTP(self._proxy)
+            code, d = duck_pool.api_generate_address(http, at)
+            if code not in (200, 201) or not d.get("address"):
+                last_err = f"DDG 生成地址失败 {code}: {d}"
+                time.sleep(2)
+                continue
+            addr = f"{d['address']}@duck.com"
+            # DB 去重：这个地址已生成过就重来（防并发/防 DDG 缓存返回旧地址）
+            conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+            dup = conn.execute(
+                "SELECT 1 FROM addresses WHERE address=?", (addr,)).fetchone()
+            conn.close()
+            if dup:
+                logger.warning(f"[duck] 地址重复 {addr}，重新生成")
+                time.sleep(1.5)
+                continue
+            # 立即登记到 duck_pool 地址表（claimed：本次注册占用，防提号 API 误发）
+            try:
+                import uuid
+                duck_pool.db_add_address(addr, user, f"claimed:{uuid.uuid4().hex[:8]}")
+            except Exception as e:
+                logger.warning(f"[duck] addr 登记失败(继续): {e}")
+            self._duck_user = user
+            self._bind_email = bind
+            self._bind_kind, self._bind_credential = self._bind_meta(user, bind)
+            self._email = addr
+            logger.info(f"[duck] 私密地址 {self._email} (账号 {user}, 收信 {bind}, source={self._bind_kind})")
+            return self._email
+        raise RuntimeError(last_err or "生成地址重试耗尽")
+
+    def wait_for_otp(self, email_addr: str, timeout: int = 240,
+                     issued_after: Optional[float] = None) -> str:
+        if self._bind_kind == "cf":
+            return self._poll_cf(timeout, issued_after)
+        if self._bind_kind == "outlook":
+            return self._poll_outlook(timeout, issued_after)
+        if self._bind_kind == "tempmail":
+            return self._poll_tempmail(timeout, issued_after)
+        return self._poll_fmail(timeout, issued_after)
+
+    def _poll_tempmail(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        """Temp-Mail 绑定邮箱：用 duck_pool 已持久化的 Bearer token 拉取 OpenAI OTP。"""
+        if not self._bind_credential:
+            raise RuntimeError(f"Temp-Mail 绑定邮箱缺少持久收信 token: {self._bind_email}")
+        import curl_cffi.requests as cr
+        from .base import extract_otp as base_extract_otp
+        s = cr.Session(impersonate="chrome124")
+        s.proxies = {"http": "socks5h://127.0.0.1:1084", "https": "socks5h://127.0.0.1:1084"}
+        deadline = time.time() + timeout
+        seen = set()
+        while time.time() < deadline:
+            try:
+                r = s.get("https://web2.temp-mail.org/messages",
+                          headers={"Authorization": f"Bearer {self._bind_credential}"}, timeout=15)
+                if r.status_code != 200:
+                    raise RuntimeError(f"Temp-Mail inbox HTTP {r.status_code}")
+                for msg in r.json().get("messages") or []:
+                    mid = msg.get("_id") or msg.get("id")
+                    if not mid or mid in seen:
+                        continue
+                    seen.add(mid)
+                    d = s.get(f"https://web2.temp-mail.org/messages/{mid}",
+                              headers={"Authorization": f"Bearer {self._bind_credential}"}, timeout=15)
+                    raw = (d.json() if d.status_code == 200 else msg)
+                    body = raw.get("bodyHtml") or raw.get("body_text") or raw.get("bodyPreview") or ""
+                    if self._is_for_me(body):
+                        otp = base_extract_otp(body)
+                        if otp:
+                            logger.info(f"[duck] ✅ OTP={otp} (tempmail, {self._email})")
+                            return otp
+            except Exception as e:
+                logger.warning(f"[duck-tempmail] poll err: {e}")
+            time.sleep(3)
+        raise TimeoutError(f"duck tempmail OTP timeout {timeout}s bind={self._bind_email}")
+
+    def _poll_outlook(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        """Outlook 绑定邮箱收信：Graph 优先，IMAP XOAUTH2 次之，Basic 只作最后兜底。"""
+        try:
+            return self._poll_outlook_graph(timeout, issued_after)
+        except Exception as e:
+            logger.warning(f"[duck-outlook] Graph 收信不可用，回退 IMAP: {e}")
+        return self._poll_outlook_imap(timeout, issued_after)
+
+    def _poll_outlook_graph(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        """直接复用面板成熟的 Graph OTP 提取器，避免 Basic IMAP 被微软拒绝。"""
+        from .outlook import fetch_otp_via_graph
+        import sqlite3
+        local = self._bind_email.split("@", 1)[0].split("+", 1)[0]
+        base_email = f"{local}@{self._bind_email.split('@', 1)[1]}"
+        conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+        try:
+            row = conn.execute("SELECT client_id, refresh_token FROM outlook_accounts WHERE email=?", (base_email,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise RuntimeError(f"Outlook 基底邮箱不在 duck_pool 号池: {base_email}")
+        return fetch_otp_via_graph(base_email, row[1] or "", row[0] or "", timeout=timeout,
+                                   threshold_ts=issued_after or (time.time() - 300), target_email=self._email)
+
+    def _poll_outlook_imap(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        """Outlook IMAP fallback：复用 duck_pool 的 XOAUTH2/密码连接逻辑。"""
+
+        import duck_pool as dp
+        import sqlite3
+        # +tag 绑定邮箱（base+tag@outlook.com）在 duck_pool 号池里存的是基底邮箱，
+        # 必须剥离 +tag 再查，否则报「不在 duck_pool outlook 号池」（实测 fail=32 根因）
+        local = self._bind_email.split("@")[0].split("+")[0]
+        base_email = f"{local}@{self._bind_email.split('@')[-1]}"
+        conn = sqlite3.connect(f"{_DP}/duck_pool.db")
+        row = conn.execute(
+            "SELECT password, client_id, refresh_token FROM outlook_accounts "
+            "WHERE email=?", (base_email,)).fetchone()
+        conn.close()
+        if not row:
+            raise RuntimeError(f"outlook 绑定邮箱 {self._bind_email} 不在 duck_pool outlook 号池（基底 {base_email} 也无）")
+        password, client_id, refresh = row[0] or "", row[1] or "", row[2] or ""
+
+        # 复用 duck_pool 的 IMAP 轮询函数（Graph 优先 + IMAP XOAUTH2/密码兜底），
+        # 但它的 extract_otp 找 DDG 的 verify?otp= 格式；OpenAI OTP 是 6 位数字，
+        # 所以这里直接用 duck_pool 的连接/文件夹扫描逻辑不可行——改为走
+        # outlook_wait_confirm_mail 的变体：轮询取原始邮件再提取 6 位 OTP。
+        import imaplib
+        import email as _email
+        import ssl as _ssl
+
+        deadline = time.time() + max(60, timeout)
+        seen: set = set()
+        # XOAUTH2 token 缓存
+        cached_token = ""
+        cached_refresh = refresh
+        cached_at = 0.0
+        use_xoauth2 = bool(client_id and refresh)
+        use_password = bool(password)
+        if not use_xoauth2 and not use_password:
+            raise RuntimeError(f"outlook {self._bind_email} 无可用 IMAP 凭据")
+        # IMAP 登录必须用基底邮箱（+tag 是别名，XOAUTH2/密码凭据属于基底）
+        login_email = base_email
+
+        while time.time() < deadline:
+            M = None
+            try:
+                if use_xoauth2 and (not cached_token or time.time() - cached_at > 2900):
+                    try:
+                        data = dp._outlook_refresh_access_token(
+                            cached_refresh, client_id, dp.OUTLOOK_IMAP_SCOPE)
+                        cached_token = data["access_token"]
+                        cached_at = time.time()
+                        if data.get("refresh_token"):
+                            cached_refresh = data["refresh_token"]
+                    except Exception as e:
+                        logger.warning(f"[duck-outlook] XOAUTH2 token 失败: {e}，改用密码")
+                        use_xoauth2 = False
+
+                last_err = None
+                for host in dp.OUTLOOK_IMAP_SERVERS:
+                    if M:
+                        break
+                    if use_xoauth2 and cached_token:
+                        try:
+                            M = imaplib.IMAP4_SSL(host, 993, timeout=30)
+                            auth_str = (f"user={login_email}\x01"
+                                        f"auth=Bearer {cached_token}\x01\x01")
+                            M.authenticate("XOAUTH2", lambda x: auth_str.encode())
+                        except Exception as e:
+                            last_err = e
+                            try: M.logout()
+                            except Exception: pass
+                            M = None
+                    if not M and use_password:
+                        try:
+                            M = imaplib.IMAP4_SSL(host, 993, timeout=30)
+                            M.login(login_email, password)
+                        except Exception as e:
+                            last_err = e
+                            try: M.logout()
+                            except Exception: pass
+                            M = None
+                if not M:
+                    raise RuntimeError(f"IMAP 连接失败: {last_err}")
+
+                folders = ["INBOX", "Junk", "Junk Email", "Spam"]
+                try:
+                    typ, listing = M.list()
+                    names_lower = {}
+                    for raw in listing or []:
+                        s = raw.decode(errors="ignore") if isinstance(raw, bytes) else str(raw)
+                        m = re.search(r'"([^"]+)"\s*$', s) or re.search(r"\s(\S+)\s*$", s)
+                        if m:
+                            nm = m.group(1).strip('"')
+                            names_lower[nm.lower()] = nm
+                    picked = []
+                    for cand in folders:
+                        real = names_lower.get(cand.lower())
+                        if real and real not in picked:
+                            picked.append(real)
+                    for k, v in names_lower.items():
+                        if any(x in k for x in ("junk", "spam", "bulk")) and v not in picked:
+                            picked.append(v)
+                    if "INBOX" not in picked:
+                        picked.insert(0, "INBOX")
+                    folders = picked or folders
+                except Exception:
+                    pass
+
+                for folder in folders:
+                    try:
+                        typ, _ = M.select(f'"{folder}"', readonly=True)
+                        if typ != "OK":
+                            continue
+                        typ, data = M.search(None, "ALL")
+                        ids = data[0].split() if data and data[0] else []
+                    except Exception:
+                        continue
+                    for mid in reversed(ids[-8:]):
+                        key = (folder, mid)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        try:
+                            typ, raw = M.fetch(mid, "(BODY.PEEK[])")
+                            raw_bytes = raw[0][1]
+                            msg = _email.message_from_bytes(raw_bytes)
+                            raw_str = raw_bytes.decode("utf-8", "ignore")
+                        except Exception:
+                            continue
+                        body = ""
+                        for part in msg.walk():
+                            if part.get_content_type() in ("text/plain", "text/html"):
+                                try:
+                                    payload = part.get_payload(decode=True) or b""
+                                    body += payload.decode(
+                                        part.get_content_charset() or "utf-8",
+                                        errors="replace") + "\n"
+                                except Exception:
+                                    continue
+                        # OpenAI 验证码提取：复用 base.extract_otp 的防误判逻辑
+                        # （span 优先 + 剔邮箱地址/时间戳/hex 颜色）
+                        from .base import extract_otp as base_extract_otp
+                        # 补头部收件人信息（_is_for_me 需要），再交给 extract_otp
+                        hdr = self._header_addrs(raw_str)
+                        raw_full = (hdr + "\n" + body) if hdr else body
+                        if not self._is_for_me(raw_full):
+                            continue
+                        otp = base_extract_otp(raw_full)
+                        if otp:
+                            logger.info(f"[duck] ✅ OTP={otp} (outlook, {self._email})")
+                            try: M.logout()
+                            except Exception: pass
+                            return otp
+            except Exception as e:
+                logger.warning(f"[duck-outlook] poll err: {e}")
+                if M:
+                    try: M.logout()
+                    except Exception: pass
+            time.sleep(4)
+        raise TimeoutError(f"duck outlook OTP timeout {timeout}s bind={self._bind_email}")
+
+    def _ensure_session(self):
+        import curl_cffi.requests as cr
+        if self._s is None:
+            self._s = cr.Session()
+            px = "socks5h://127.0.0.1:1080"
+            self._s.proxies = {"http": px, "https": px}
+        return self._s
+
+    @staticmethod
+    def _header_addrs(raw: str) -> str:
+        """解析邮件头区的收件人相关头（To/Delivered-To/X-Original-To/Envelope-To），
+        处理折叠头，返回拼接字符串。仅限头部区（首个空行前），避免正文误匹配。"""
+        header = raw.split("\n\n", 1)[0] if "\n\n" in raw else raw
+        vals: dict = {}
+        cur = None
+        for line in header.splitlines():
+            if re.match(r"^\s", line) and cur:
+                vals[cur] = vals.get(cur, "") + " " + line.strip()
+                continue
+            m = re.match(r"^([^:]+):\s*(.*)$", line)
+            if m:
+                cur = m.group(1).lower().strip()
+                vals[cur] = m.group(2)
+            else:
+                cur = None
+        parts = []
+        for k in ("to", "delivered-to", "x-original-to", "envelope-to", "x-envelope-to"):
+            if k in vals:
+                parts.append(vals[k])
+        return " ".join(parts)
+
+    def _is_for_me(self, raw: str) -> bool:
+        """判断邮件是否发给本任务地址（带边界，防 nota@duck.com 误匹配）。
+
+        优先头部收件人字段精确匹配；无头部字段时退而全文边界匹配。
+        """
+        pat = r"(?i)(?:^|[\s<\"'(])\s*" + re.escape(self._email) + r"\s*(?:$|[\s>\"'),])"
+        hdr = self._header_addrs(raw)
+        if hdr.strip():
+            return re.search(pat, hdr) is not None
+        return re.search(pat, raw) is not None
+
+    @staticmethod
+    def _mail_ts(raw: str) -> Optional[float]:
+        """从 Received 头解析邮件时间（epoch），失败返回 None。"""
+        m = re.search(
+            r"(?im)^received:.*?;\s*([a-z]{3},\s*\d{1,2}\s+[a-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+[+-]\d{4})",
+            raw)
+        if not m:
+            return None
+        try:
+            from email.utils import parsedate_to_datetime
+            return parsedate_to_datetime(m.group(1)).timestamp()
+        except Exception:
+            return None
+
+    def _poll_cf(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        import duck_pool
+        import requests
+        from .base import extract_otp as base_extract_otp
+        s = requests.Session()
+        s.headers.update({"User-Agent": duck_pool.UA, "Content-Type": "application/json",
+                          "x-admin-auth": duck_pool.CF_ADMIN_TOKEN})
+        s.proxies = {"http": duck_pool.CF_PROXY, "https": duck_pool.CF_PROXY}
+        # 轮询起始快照：只处理之后新出现的邮件，避免历史 OTP
+        base_ids = set()
+        r0 = s.get(f"{duck_pool.CF_API_URL}/admin/mails",
+                   params={"limit": 50, "offset": 0, "address": self._bind_email}, timeout=15)
+        if r0.status_code != 200:
+            raise RuntimeError(f"CF 收件箱快照失败 HTTP {r0.status_code}")
+        d0 = r0.json()
+        if not isinstance(d0, dict):
+            raise RuntimeError("CF 收件箱快照响应异常")
+        for m in (d0.get("results") or []):
+            if isinstance(m, dict) and m.get("id"):
+                base_ids.add(str(m["id"]))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r = s.get(f"{duck_pool.CF_API_URL}/admin/mails",
+                          params={"limit": 50, "offset": 0, "address": self._bind_email},
+                          timeout=15)
+                if r.status_code == 200:
+                    d = r.json()
+                    if not isinstance(d, dict):
+                        continue
+                    mails = d.get("results") or d.get("mails") or []
+                    if not isinstance(mails, list):
+                        continue
+                    for m in sorted(mails, key=lambda x: x.get("id", 0) if isinstance(x, dict) else 0, reverse=True):
+                        if not isinstance(m, dict):
+                            continue
+                        mid = str(m.get("id", ""))
+                        if not mid or mid in self._seen:
+                            continue
+                        raw = duck_pool._decode_mail_raw(str(m.get("raw") or ""))
+                        ts = self._mail_ts(raw)
+                        # 发码时间可解析：按时间过滤（即使快照里有也不排除，防漏取当前 OTP）
+                        if issued_after is not None:
+                            if ts is not None:
+                                if ts < issued_after:
+                                    continue
+                            else:
+                                # 无法解析时间 → 保守：快照里已有的跳过（防历史 OTP）
+                                if mid in base_ids:
+                                    continue
+                        else:
+                            if mid in base_ids:
+                                continue
+                        self._seen.add(mid)
+                        if not self._is_for_me(raw):
+                            continue
+                        otp = base_extract_otp(raw)
+                        if otp:
+                            logger.info(f"[duck] ✅ OTP={otp} (cf, {self._email})")
+                            return otp
+            except Exception as e:
+                logger.warning(f"[duck] cf poll err: {e}")
+            time.sleep(3)
+        raise TimeoutError(f"duck cf OTP timeout {timeout}s bind={self._bind_email}")
+
+    def _poll_fmail(self, timeout: int, issued_after: Optional[float] = None) -> str:
+        user = self._bind_email.split("@")[0]
+        host = self._bind_email.split("@")[-1]
+        s = self._ensure_session()
+        # 快照起始 token，只处理新邮件；received_at 过滤 issued_after
+        base_tokens = set()
+        try:
+            r0 = s.get(f"https://fmail.men/api/inbox/{user}?domain={host}", timeout=15)
+            if r0.status_code == 200:
+                for m in (r0.json().get("emails") or []):
+                    if m.get("token"):
+                        base_tokens.add(str(m["token"]))
+        except Exception:
+            pass
+        if not self._fmail_seen:
+            self._fmail_seen = set()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r = s.get(f"https://fmail.men/api/inbox/{user}?domain={host}", timeout=15)
+                if r.status_code == 200:
+                    for m in (r.json().get("emails") or []):
+                        tok = str(m.get("token", ""))
+                        if not tok or tok in base_tokens or tok in self._fmail_seen:
+                            continue
+                        self._fmail_seen.add(tok)
+                        # 只接收发码之后的新邮件
+                        if issued_after:
+                            recv = m.get("received_at")
+                            if recv and (recv / 1000.0) < issued_after:
+                                continue
+                        r2 = s.get(f"https://fmail.men/api/email/{tok}", timeout=15)
+                        if r2.status_code == 200:
+                            m2 = r2.json()
+                            body = (m2.get("body_html") or m2.get("body_text") or "")
+                            # 头部字段拼入（_is_for_me 需要识别收件人地址）
+                            hdrs = ""
+                            for hk in ("headers", "to", "delivered_to", "envelope_to"):
+                                hv = m2.get(hk)
+                                if isinstance(hv, dict):
+                                    hv = " ".join(str(v) for v in hv.values())
+                                if hv:
+                                    hdrs += " " + str(hv)
+                            raw_full = (hdrs + "\n" + str(body)) if hdrs else str(body)
+                            if not self._is_for_me(raw_full):
+                                continue
+                            otp = extract_otp(raw_full)
+                            if otp:
+                                logger.info(f"[duck] ✅ OTP={otp} (fmail, {self._email})")
+                                return otp
+            except Exception as e:
+                logger.warning(f"[duck] fmail poll err: {e}")
+            time.sleep(3)
+        raise TimeoutError(f"duck fmail OTP timeout {timeout}s bind={self._bind_email}")

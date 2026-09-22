@@ -54,6 +54,12 @@ const routes = [
     meta: { title: '运行记录', icon: 'Document', group: '数据' },
   },
   {
+    path: '/tempo-store',
+    name: 'tempo-store',
+    component: () => import('@/views/TempoMailStore.vue'),
+    meta: { title: '邮箱库', icon: 'Message', group: '数据' },
+  },
+  {
     path: '/settings/mail',
     name: 'mail',
     component: () => import('@/views/MailConfig.vue'),

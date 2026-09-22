@@ -6,9 +6,13 @@ import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const cpa = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴 CPA 管理密钥', timeout: 30 })
 const sub = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴面板里生成的 x-api-key', groupIds: '2', timeout: 30 })
+const c2a = reactive({ enabled: false, url: 'http://127.0.0.1:8059', key: '', keyPh: '填写本机 ChatGPT2API 管理密钥', timeout: 30 })
+
 const saving = ref(false)
 const testingCpa = ref(false)
 const testingSub = ref(false)
+const testingC2a = ref(false)
+
 
 async function load() {
   try {
@@ -24,6 +28,12 @@ async function load() {
     sub.keyPh = config.sub2api_api_key === '***' ? '已设置（留空不修改）' : '粘贴面板里生成的 x-api-key'
     sub.groupIds = config.sub2api_group_ids || '2'
     sub.timeout = Number(config.sub2api_timeout || 30)
+    c2a.enabled = config.c2a_enabled === '1'
+    c2a.url = config.c2a_url || 'http://127.0.0.1:8059'
+    c2a.key = ''
+    c2a.keyPh = config.c2a_api_key === '***' ? '已设置（留空不修改）' : '填写本机 ChatGPT2API 管理密钥'
+    c2a.timeout = Number(config.c2a_timeout || 30)
+
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -40,6 +50,11 @@ async function save() {
       sub2api_api_key: sub.key.trim() || '***',
       sub2api_group_ids: sub.groupIds.trim() || '2',
       sub2api_timeout: String(sub.timeout || 30),
+      c2a_enabled: c2a.enabled ? '1' : '0',
+      c2a_url: c2a.url.trim(),
+      c2a_api_key: c2a.key.trim() || '***',
+      c2a_timeout: String(c2a.timeout || 30),
+
     })
     ElMessage.success('保存成功')
     load()
@@ -48,7 +63,7 @@ async function save() {
 }
 
 async function test(target) {
-  const flag = target === 'cpa' ? testingCpa : testingSub
+  const flag = target === 'cpa' ? testingCpa : (target === 'sub2api' ? testingSub : testingC2a)
   flag.value = true
   try { const r = await testExport(target); ElMessage.success(r.message || '连通正常') }
   catch (e) { ElMessage.error(e.message) }
@@ -104,12 +119,29 @@ onActivated(() => load())
         </el-form-item>
         <el-button :loading="testingSub" @click="test('sub2api')">测试 SUB2API 连通性</el-button>
 
+        <el-divider content-position="left">本机 ChatGPT2API</el-divider>
+        <el-form-item>
+          <el-checkbox v-model="c2a.enabled">启用本机 ChatGPT2API 自动导入（POST /api/accounts）</el-checkbox>
+        </el-form-item>
+        <el-form-item label="ChatGPT2API URL">
+          <el-input v-model="c2a.url" placeholder="http://127.0.0.1:8059" />
+        </el-form-item>
+        <el-form-item label="管理密钥（Authorization Bearer）">
+          <el-input v-model="c2a.key" type="password" show-password :placeholder="c2a.keyPh" />
+        </el-form-item>
+        <el-form-item label="超时 (秒)">
+          <el-input-number v-model="c2a.timeout" :min="5" :max="300" />
+        </el-form-item>
+        <el-button :loading="testingC2a" @click="test('chatgpt2api')">测试 ChatGPT2API 连通性</el-button>
+
+
+
       </el-form>
     </el-card>
 
     <FooterToolbar>
       <template #left>
-        CPA {{ cpa.enabled ? '已启用' : '未启用' }} · SUB2API {{ sub.enabled ? '已启用' : '未启用' }}
+        CPA {{ cpa.enabled ? '已启用' : '未启用' }} · SUB2API {{ sub.enabled ? '已启用' : '未启用' }} · ChatGPT2API {{ c2a.enabled ? '已启用' : '未启用' }}
       </template>
       <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
     </FooterToolbar>

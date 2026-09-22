@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
+import { syncProxyPool, getProxyHealth } from '@/api/proxy'
 
 const KEY = 'dango_proxy_pool_v1'
 const OLD_FORM_KEY = 'gpt_outlook_register_form_v2'
@@ -15,7 +16,7 @@ function dedup(arr) {
 // 自动跑号时按 worker 顺序轮流取用（后端 /api/auto/start 的 proxy_pool 字段）。
 export const useProxyStore = defineStore('proxy', () => {
   let saved = []
-  try { saved = JSON.parse(localStorage.getItem(KEY) || '[]') } catch (_) { saved = [] }
+  try { saved = (JSON.parse(localStorage.getItem(KEY) || '[]') || []).filter((x) => typeof x === 'string') } catch (_) { saved = [] }
   // 从旧版「全自动批量」页的 autoProxyPool textarea 迁移一次
   if (!saved.length) {
     try {
@@ -28,9 +29,39 @@ export const useProxyStore = defineStore('proxy', () => {
   const text = computed(() => list.value.join('\n'))
   const count = computed(() => list.value.length)
 
+  // 代理健康状态
+  const health = ref({ proxies: {}, last_check_at: 0, healthy: 0, unhealthy: 0, removed: [], total: 0 })
+  const healthLoading = ref(false)
+  const healthyCount = computed(() => health.value.healthy ?? 0)
+  const unhealthyCount = computed(() => health.value.unhealthy ?? 0)
+  const removedCount = computed(() => health.value.removed_count ?? 0)
+  const totalInPool = computed(() => health.value.total ?? 0)
+
+  const syncError = ref('')
+  const syncErrorTimer = ref(null)
+
   watch(list, (v) => {
-    try { localStorage.setItem(KEY, JSON.stringify(v)) } catch (_) {}
+    const clean = v.filter((x) => typeof x === 'string')   // 防御：只持久化字符串代理
+    try { localStorage.setItem(KEY, JSON.stringify(clean)) } catch (_) {}
+    // 同步到后端（防抖：1s 内多次修改只发一次）
+    debounceSync(clean)
   }, { deep: true })
+
+  // 防抖同步到后端
+  let syncTimer = null
+  function debounceSync(v) {
+    if (syncTimer) clearTimeout(syncTimer)
+    syncTimer = setTimeout(async () => {
+      try {
+        await syncProxyPool(v)
+        syncError.value = ''
+      } catch (e) {
+        syncError.value = e?.message || '代理池同步失败'
+        if (syncErrorTimer.value) clearTimeout(syncErrorTimer.value)
+        syncErrorTimer.value = setTimeout(() => { syncError.value = '' }, 8000)
+      }
+    }, 1000)
+  }
 
   /** 用整段文本覆盖代理池（自动去重）。返回 { added, duplicated } 供提示。 */
   function setFromText(s) {
@@ -55,7 +86,39 @@ export const useProxyStore = defineStore('proxy', () => {
     list.value = []
   }
 
-  return { list, text, count, setFromText, append, remove, clear }
+  /** 从后端获取代理健康状态。 */
+  async function fetchHealth() {
+    healthLoading.value = true
+    try {
+      const res = await getProxyHealth()
+      if (res.ok) {
+        health.value = {
+          proxies: res.proxies || {},
+          last_check_at: res.last_check_at || 0,
+          healthy: res.healthy || 0,
+          unhealthy: res.unhealthy || 0,
+          removed: res.removed || [],
+          removed_count: res.removed_count || 0,
+          total: res.total || 0,
+          checker_status: res.checker_status || {},
+        }
+      }
+    } catch (_) { /* silent */ }
+    finally { healthLoading.value = false }
+  }
+
+  /** 获取某代理的健康状态。 */
+  function getProxyHealthItem(proxy) {
+    return health.value.proxies[proxy] || null
+  }
+
+  return {
+    list, text, count,
+    health, healthLoading, healthyCount, unhealthyCount, removedCount, totalInPool,
+    syncError,
+    setFromText, append, remove, clear,
+    fetchHealth, getProxyHealthItem,
+  }
 })
 
 /**

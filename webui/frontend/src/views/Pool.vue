@@ -10,12 +10,15 @@ import {
 import { getMailProviders } from '@/api/settings'
 import { useStatsStore } from '@/stores/stats'
 import { useRuntimeStore } from '@/stores/runtime'
+import { useProxyStore } from '@/stores/proxy'
 import StatusDot from '@/components/StatusDot.vue'
 
 const router = useRouter()
 const statsStore = useStatsStore()
 const runtime = useRuntimeStore()
 const { dataVersion } = storeToRefs(runtime)
+const proxyStore = useProxyStore()
+const { syncError } = storeToRefs(proxyStore)
 
 const PAGE_SIZE = 20
 const rows = ref([])
@@ -135,6 +138,7 @@ loadProviders()
 </script>
 <template>
   <div class="page">
+    <el-alert v-if="syncError" :title="`代理池同步失败：${syncError}`" type="warning" show-icon :closable="false" style="margin-bottom: 16px" />
     <el-card shadow="never">
       <template #header>
         <span class="section-title" style="margin: 0">邮箱列表</span>

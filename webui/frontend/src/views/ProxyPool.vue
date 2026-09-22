@@ -14,9 +14,11 @@ const testResults = ref({}) // proxy -> { status:'testing'|'ok'|'fail', latency_
 const testingAll = ref(false)
 
 const rows = computed(() =>
-  list.value.map((p, i) => ({
-    index: i + 1, proxy: p, valid: isValidProxy(p), result: testResults.value[p] || null,
-  })),
+  list.value
+    .filter((p) => typeof p === 'string')   // 防御：跳过非字符串脏数据（曾出现 [object Object]）
+    .map((p, i) => ({
+      index: i + 1, proxy: p, valid: isValidProxy(p), result: testResults.value[p] || null,
+    })),
 )
 const invalidCount = computed(() => rows.value.filter((r) => !r.valid).length)
 

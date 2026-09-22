@@ -13,7 +13,8 @@ import {
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
   Loading, Select, CircleClose, Refresh, CopyDocument,
-  Bell, Close, Download,
+  RefreshRight,
+  Bell, Close, Download, Search,
 } from '@element-plus/icons-vue'
 
 import App from './App.vue'
@@ -24,7 +25,8 @@ const ICONS = {
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
   Loading, Select, CircleClose, Refresh, CopyDocument,
-  Bell, Close, Download,
+  RefreshRight,
+  Bell, Close, Download, Search,
 }
 
 const app = createApp(App)

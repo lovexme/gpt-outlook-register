@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -14,6 +15,9 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Optional
+
+import urllib.request
+import json
 
 ROOT = Path(__file__).resolve().parents[1]  # gpt-outlook-register/
 sys.path.insert(0, str(ROOT))
@@ -32,6 +36,66 @@ from . import db  # noqa: E402
 # run_id -> queue of log strings; sentinel = None 表示流结束
 _run_queues: dict[str, queue.Queue] = {}
 _lock = threading.Lock()
+
+
+def _check_plus_after_registration(d: dict, proxy: Optional[str]) -> None:
+    """注册成功后，用同一个注册 IP 立刻查优惠状态，写入 extra_json.plus_check。
+
+    之前是全部账号走后端统一 proxy（check_plus_proxy，常为 sing-box 7890）
+    批量检测——单 IP 检测几百个号既容易触发 OpenAI 风控、优惠结果也不准
+    （OpenAI 的 eligible_promo_campaigns 是 IP 地区相关的）。这里在注册线程
+    结束时顺手查一次，出口 IP == 注册 IP，自然分散又准确。
+    """
+    at = (d.get("access_token") or "").strip()
+    email = (d.get("email") or "").strip()
+    if not at or not email:
+        return
+    import json as _json
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return
+    proxies = None
+    if proxy:
+        norm = proxy
+        if norm.startswith("socks5://"):
+            norm = "socks5h://" + norm[len("socks5://"):]
+        proxies = {"https": norm, "http": norm}
+    resp = cffi_requests.get(
+        "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        headers={
+            "Authorization": f"Bearer {at}",
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/145.0.0.0 Safari/537.36"
+            ),
+        },
+        proxies=proxies,
+        impersonate="chrome110",
+        timeout=15,
+    )
+    if resp.status_code == 401:
+        info = {"status": "banned", "label": "封号（401）", "workspaces": [], "offers": []}
+    elif resp.status_code != 200:
+        info = {"status": "check_error", "label": f"检测失败 HTTP {resp.status_code}",
+                "workspaces": [], "offers": []}
+    else:
+        data = _json.loads(resp.text)
+        # 复用 app.py 的完整解析
+        try:
+            from .app import _parse_account_check
+            info = _parse_account_check(data)
+        except Exception:
+            # 解析失败时兜底
+            info = {"status": "check_error", "label": "解析失败",
+                    "workspaces": [], "offers": []}
+    db.update_plus_check(email, {**info, "checked_at": time.time()})
+    logger = logging.getLogger("registrar")
+    logger.info(
+        f"[register] 注册后检测优惠: {email} -> {info.get('status')} ({info.get('label')})"
+    )
 
 # 当前线程正在跑哪个 run。
 # ⚠️ 为什么需要这个：QueueLogHandler 是挂在 **root logger** 上的，而 root logger
@@ -90,6 +154,57 @@ class QueueLogHandler(logging.Handler):
         super().close()
 
 
+def _bind_2fa_if_enabled(run_id: str, flow: Any, d: dict, cfg) -> None:
+    """注册成功后自动绑定 TOTP 2FA（通过 WebUI 设置开关控制）。
+
+    读取 settings 里的 auto_bind_2fa 开关，启用时调用快路径
+    bind_totp_2fa_inline 绑定，失败不影响注册结果。
+    """
+    try:
+        from .two_factor import bind_totp_2fa_inline
+        from . import db as _db
+        enabled = _db.get_setting("auto_bind_2fa", "").strip()
+        if enabled != "1":
+            return
+        at = (d.get("access_token") or "").strip()
+        if not at:
+            return
+        logging.getLogger("registrar").info(
+            "[2fa] 注册成功，自动绑定 TOTP 2FA..."
+        )
+        result = bind_totp_2fa_inline(flow, at)
+        if result and result.get("secret"):
+            # 保存 secret 到 extra_json
+            try:
+                import json as _json
+                email = (d.get("email") or "").strip()
+                if email:
+                    old = _db.get_registered(email) or {}
+                    extra = {}
+                    if old.get("extra_json"):
+                        try:
+                            extra = _json.loads(old["extra_json"])
+                        except Exception:
+                            extra = {}
+                    extra["totp_secret"] = result["secret"]
+                    _db.set_extra_json(email, _json.dumps(extra, ensure_ascii=False))
+                    logging.getLogger("registrar").info(
+                        "[2fa] TOTP secret 已保存到 extra_json"
+                    )
+            except Exception as e:
+                logging.getLogger("registrar").warning(
+                    f"[2fa] 保存 secret 失败: {e}"
+                )
+        elif result is None:
+            logging.getLogger("registrar").info("[2fa] 该号已绑定 2FA，跳过")
+        else:
+            logging.getLogger("registrar").warning("[2fa] 绑定失败（不影响注册）")
+    except Exception as e:
+        logging.getLogger("registrar").warning(
+            f"[2fa] 绑定异常（不影响注册）: {e}"
+        )
+
+
 def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     """前端约定：以 `__EVENT__:` 开头的行被解析成 JSON 状态事件。"""
     import json as _json
@@ -144,7 +259,7 @@ _NETWORK_ERROR_PATTERNS = [
     "proxy", "socks", "dns", "name resolution", "name or service",
     "cloudflare", "just a moment", "403 forbidden",
     "csrf token 获取失败", "csrf token 失败",
-    "/sentinel/req", "sentinel /req", "sentinel quickjs",
+    "/sentinel/req", "sentinel /req",
     "check_proxy 失败", "网络预检查",
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
     "remote disconnected", "connection reset", "connection aborted",
@@ -166,7 +281,7 @@ def classify_error(err: str, mail_source: str = "") -> str:
         "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
         "outlook imap account unusable", "user is authenticated but not connected",
         "outlook refresh failed", "authentication failed", "authenticate failed",
-        "outlook otp timeout", "registration_disallowed",
+        "otp timeout", "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
     ]
     if mail_source:
@@ -217,6 +332,9 @@ def _do_register(
         root_logger.setLevel(logging.INFO)
 
     email = account["email"]
+    # 记录任务开始前是否已有本地行；失败清理只能删除本轮新建的 pending 行，
+    # 绝不能碰重跑时已经存在的 registered（尤其是完整凭证）。
+    preexisting_registered = db.get_registered(email) is not None
     # 提前读取，避免在 try 块前异常时 except 引用未定义
     mail_source = db.get_setting("mail_source", "outlook")
     # 要不要操作号池（mark_done / mark_failed / release）由 provider 声明的
@@ -226,6 +344,7 @@ def _do_register(
         is_pooled = get_provider_class(mail_source).pooled
     except MailProviderError:
         is_pooled = True
+    claim_token = account.get("claim_token") if is_pooled else None
 
     try:
         # 本次注册专属的配置覆盖。
@@ -238,7 +357,23 @@ def _do_register(
         # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
         # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
         env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
-        env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 180))
+        # OTP 等待超时：duck 源（DDG @duck.com → outlook 转发）确认信延迟 30-60s+，
+        # 前端默认 10s 必挂（实测 2026-09-15: timeout 10s 全失败，54s 才收到 OTP）。
+        # 对 duck 源强制下限 90s；实测 6285 样本 99% 会来的信 <30s、60-89s 仅 1 例，
+        # 90s 只损失极少数慢信、失败号空等省 90s（2026-09-16 优化）。
+        _otp_raw = int(options.get("otp_timeout") or 180)
+        if mail_source == "duck":
+            _otp_raw = max(90, _otp_raw)
+        env_overrides["OTP_TIMEOUT"] = str(_otp_raw)
+        # OAUTH_CODEX_RT_BEFORE_CALLBACK 默认 1：create-account 后先跑 Codex OAuth 换 RT；
+        # 但回落 /log-in 时 _codex_drive_login_from_log_in 的 login 推进会破坏注册主会话，
+        # 导致后续 follow_redirect_chain 拿不到 callback → session/AT 全无 →
+        # “注册完成但未获取有效凭证”（2026-09-16 实测 31/105 失败）。强制 0：
+        # 先消费 callback 拿 session/AT（必成），Codex RT 留到 L3297 之后再尝试，RT 不受影响。
+        env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+        # Codex RT 回落 add-phone 时刷新重试 3 次几乎必败（新号强制绑手机），
+        # 每次浪费 ~10s + 告警；关闭重试，一次不成即放弃（2026-09-16 全链路剖析）
+        env_overrides["OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY"] = "0"
         # 用户不要 refresh_token → 直接跳过 Codex OAuth（每次都失败浪费 ~10s + 一堆告警）
         if not options.get("want_refresh_token", True):
             env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
@@ -248,11 +383,24 @@ def _do_register(
 
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
+        # 未指定注册代理时从全局代理池随机轮换一个（多 IP 分散，避免 GPT 注册直连/单 IP）
+        if not cfg.proxy:
+            try:
+                from . import db as _db
+                import random as _random
+                _pool = _db.get_proxy_pool()
+                if _pool:
+                    cfg.proxy = _random.choice(_pool)
+            except Exception:
+                pass
 
         # ─ 邮箱来源路由 ─
         # 原来是 if cf_temp / else outlook 的写死分支，加一种邮箱就得回来改。
         # 现在交给注册表工厂：provider 自己从 settings + account 里取需要的字段。
-        mail = create_mail_provider(mail_source, db.get_mail_settings(), account)
+        mail_settings = dict(db.get_mail_settings())
+        if cfg.proxy:
+            mail_settings["proxy"] = cfg.proxy
+        mail = create_mail_provider(mail_source, mail_settings, account)
         logging.getLogger("registrar").info(
             f"[register] 邮箱来源: {mail_source} ({mail.display_name})"
         )
@@ -262,6 +410,7 @@ def _do_register(
             sms_callback=_build_sms_callback(run_id),
             env_overrides=env_overrides,
             on_password=_save_password_early,
+            allow_existing_login=bool(options.get("allow_existing_login", True)),
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
@@ -272,37 +421,60 @@ def _do_register(
             result = flow.run_register(mail)
             d = result.to_dict()
         except RuntimeError as e:
-            # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
-            d = flow.result.to_dict()
-            need_access = options.get("want_access_token", True)
-            need_session = options.get("want_session_token", True)
-            need_refresh = options.get("want_refresh_token", True)
-            # 用户勾选的凭证全拿到 → 算正常完成（不视为 partial）
-            wanted_ok = (
-                (not need_access or d.get("access_token"))
-                and (not need_session or d.get("session_token"))
-                and (not need_refresh or d.get("refresh_token"))
-            )
-            has_any = bool(
-                d.get("access_token") or d.get("refresh_token") or d.get("session_token")
-            )
-            if wanted_ok and has_any:
-                logging.getLogger("registrar").warning(
-                    f"[register] 流程末段异常但用户勾选的凭证已齐: {e}"
-                )
-            elif has_any:
-                partial = True
-                logging.getLogger("registrar").warning(
-                    f"[register] 部分凭证 (缺用户勾选的某项): {e}"
-                )
+            err_str = str(e)
+            # HTTP 409 invalid_state = session 冲突，新建 session 重试一次
+            if "409" in err_str and "invalid_state" in err_str:
+                logging.getLogger("registrar").warning(f"[register] 409 冲突，重置 session 重试: {e}")
+                try:
+                    flow2 = AuthFlow(
+                        Config(proxy=cfg.proxy),
+                        sms_callback=_build_sms_callback(run_id),
+                        env_overrides=env_overrides,
+                        on_password=_save_password_early,
+                    )
+                    result2 = flow2.run_register(mail)
+                    d = result2.to_dict()
+                except RuntimeError as e2:
+                    err_str2 = str(e2)
+                    # 重试仍然 409 → 走原始 partial 逻辑
+                    if "409" in err_str2 and "invalid_state" in err_str2:
+                        logging.getLogger("registrar").warning(f"[register] 409 重试仍然失败，按 partial 处理: {e2}")
+                        d = flow.result.to_dict()
+                    else:
+                        raise
             else:
-                raise
+                # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
+                d = flow.result.to_dict()
+                need_access = options.get("want_access_token", True)
+                need_session = options.get("want_session_token", True)
+                need_refresh = options.get("want_refresh_token", True)
+                # 用户勾选的凭证全拿到 → 算正常完成（不视为 partial）
+                wanted_ok = (
+                    (not need_access or d.get("access_token"))
+                    and (not need_session or d.get("session_token"))
+                    and (not need_refresh or d.get("refresh_token"))
+                )
+                has_any = bool(
+                    d.get("access_token") or d.get("refresh_token") or d.get("session_token")
+                )
+                if wanted_ok and has_any:
+                    logging.getLogger("registrar").warning(
+                        f"[register] 流程末段异常但用户勾选的凭证已齐: {e}"
+                    )
+                elif has_any:
+                    partial = True
+                    logging.getLogger("registrar").warning(
+                        f"[register] 部分凭证 (缺用户勾选的某项): {e}"
+                    )
+                else:
+                    raise
 
         # ─ 用户选项过滤：未勾选的字段从结果里抹掉，DB 只存用户想要的
         full = d
         d = {
             "email": full.get("email", ""),
             "password": full.get("password", ""),
+            "exit_ip": options.get("exit_ip", ""),
         }
         if options.get("want_access_token", True):
             d["access_token"] = full.get("access_token", "")
@@ -314,7 +486,50 @@ def _do_register(
             d["id_token"] = full.get("id_token", "")
 
         # 落库
+        if options.get("want_access_token", True) and not d.get("access_token"):
+            # 没有 access_token 的号不可用，不进注册结果
+            logging.getLogger("registrar").warning(
+                f"[register] 跳过无 access_token 的号: {d.get('email','')}"
+            )
+            if is_pooled:
+                db.release_unused(email, claim_token)
+            db.finish_run(run_id, "failed", "no_access_token", "未拿到 access_token")
+            _emit_status(run_id, "error", {
+                "message": f"未拿到 access_token（{d.get('email','')}）",
+            })
+            return
+
         db.save_registered(d)
+        # ─ 邮箱注册成功 → 保存邮箱到本地库（所有非池化 provider，方便二次接码/复用）─
+        try:
+            if not is_pooled:
+                from .mail_store import MailStore
+                _store = MailStore(os.path.join(Path(__file__).resolve().parent, "tempo_mail_store.db"))
+                _app_token = ""
+                _email_token = ""
+                if mail_source == "tempo":
+                    try:
+                        _app_token = db.get_setting("tempo_app_token", "").strip()
+                    except Exception:
+                        pass
+                # provider 实例上的 token：tempmail=JWT(_token)，tempo=email_token(_email_token)
+                _email_token = (
+                    getattr(mail, "_email_token", "") or getattr(mail, "_token", "") or ""
+                )
+                _store.add(
+                    email=d.get("email") or email,
+                    domain=(d.get("email") or "").split("@")[-1] if d.get("email") else "",
+                    email_token=_email_token,
+                    app_token=_app_token,
+                    source=mail_source,
+                    env="webui",
+                    expire_at=(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 2678400))),
+                )
+                logging.getLogger("registrar").info(
+                    f"[register] 邮箱已保存到本地库: {d.get('email') or email} (source={mail_source})"
+                )
+        except Exception as _se:
+            logging.getLogger("registrar").warning(f"[register] 保存邮箱到库失败: {_se}")
         # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
         #    重跑一个之前设过密码的邮箱时，OpenAI 会认成已有账号 → passwordless_login
         #    → register_password 根本不执行 → d["password"] 是空的。
@@ -338,10 +553,22 @@ def _do_register(
         # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
         # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
         if is_pooled:
-            db.mark_done(email)
+            db.mark_done(email, claim_token)
+
+        # ─ 注册后用注册 IP 检测优惠状态（不影响主流程） ─
+        if d.get("access_token"):
+            try:
+                _check_plus_after_registration(d, cfg.proxy)
+            except Exception as e:
+                logging.getLogger("registrar").warning(
+                    f"[register] 检测优惠失败: {e}"
+                )
+
+        # ─ 可选：注册成功后自动绑定 TOTP 2FA（启用后在检测优惠后进行） ─
+        _bind_2fa_if_enabled(run_id, flow, d, cfg)
 
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
-        _try_export_to_panels(run_id, d)
+        _try_export_to_panels(run_id, d, proxy=cfg.proxy)
 
         result_summary = {
             "email": d.get("email"),
@@ -381,6 +608,21 @@ def _do_register(
                 logging.getLogger("registrar").error(
                     f"[register] 该号已生成密码，请自行留存: {flow.result.email or email} / {_pw}"
                 )
+                # 只有本轮 save_password_early 新建的 pending 行才允许清理；
+                # 原有 registered 行（即使本轮失败）一律保留，遵守不删旧号/不清凭证。
+                if not preexisting_registered:
+                    try:
+                        saved = db.get_registered(flow.result.email or email) or {}
+                        extra = saved.get("extra") or {}
+                        if extra.get("pending"):
+                            db.delete_registered(flow.result.email or email)
+                            logging.getLogger("registrar").info(
+                                f"[register] 已删除本轮 pending 半成品行: {flow.result.email or email}"
+                            )
+                    except Exception as del_e:
+                        logging.getLogger("registrar").warning(
+                            f"[register] 删除 pending 行失败: {del_e}"
+                        )
         except Exception:
             pass  # flow 还没建出来（异常发生在 AuthFlow 之前），没密码可救
         if category != "account":
@@ -388,12 +630,12 @@ def _do_register(
         # 非池化 provider 没有号池记录，不操作
         if is_pooled:
             if category == "network":
-                db.release_unused(email)
+                db.release_unused(email, claim_token)
                 logging.getLogger("registrar").warning(
                     f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
                 )
             else:
-                db.mark_failed(email, f"[{category}] {err}")
+                db.mark_failed(email, f"[{category}] {err}", claim_token)
         db.finish_run(run_id, "failed", err, category=category)
         _emit_status(run_id, "error", {"message": err, "category": category})
         _send_webhook("register_failed", email, err)
@@ -415,7 +657,7 @@ def _do_register(
         _current_run.run_id = None
 
 
-def _try_export_to_panels(run_id: str, cred: dict) -> None:
+def _try_export_to_panels(run_id: str, cred: dict, *, proxy: str = "") -> None:
     """注册完成后可选地把凭证导出到 CPA / SUB2API 面板。
 
     - 任一目标的"启用"开关关闭时,该目标跳过(不发请求);两者都未启用时整段 no-op。
@@ -429,7 +671,8 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
 
     cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
     sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
-    if not (cpa_enabled or sub2api_enabled):
+    c2a_enabled = bool(cfg.get("chatgpt2api", {}).get("enabled"))
+    if not (cpa_enabled or sub2api_enabled or c2a_enabled):
         return  # 用户没勾选任何目标 → 完全不执行
 
     from . import exporter  # 懒 import,避免未启用时强依赖
@@ -453,6 +696,8 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
             cred,
             cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
             sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
+            chatgpt2api_cfg=cfg.get("chatgpt2api") if c2a_enabled else None,
+            proxy=proxy,
             log_fn=_log,
         )
     except Exception as e:
@@ -467,6 +712,10 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
     if results.get("sub2api") is not None:
         summary["sub2api"] = {"ok": bool(results["sub2api"].get("ok")),
                               "message": results["sub2api"].get("message") or results["sub2api"].get("error") or ""}
+    if results.get("chatgpt2api") is not None:
+        summary["chatgpt2api"] = {"ok": bool(results["chatgpt2api"].get("ok")),
+                                   "message": results["chatgpt2api"].get("message") or results["chatgpt2api"].get("error") or ""}
+
     try:
         _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary})
     except Exception:
@@ -492,14 +741,14 @@ def _save_password_early(email: str, password: str) -> None:
         log.warning(f"[register] 密码落盘失败，仅剩日志兜底: {e}")
 
 
-def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
+def _build_sms_callback(run_id: str, *, force_enabled: bool = False) -> Optional[PhoneCallbackController]:
     """根据 webui 配置创建 SMS 接码 controller。
 
     未启用接码或未配置 API key 时返回 None，flow 会回退到环境变量路径。
     log_fn 把租号/等码的状态推到 SSE 流，前端可见。
     """
     cfg = db.get_sms_internal_config()
-    if not cfg.get("sms_enabled"):
+    if not force_enabled and not cfg.get("sms_enabled"):
         return None
     api_key = (cfg.get("sms_api_key") or "").strip()
     if not api_key:
@@ -530,11 +779,35 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
         return None
 
 
+def _get_exit_ip(proxy: str) -> str:
+    """通过代理查出口 IP，失败返回空字符串"""
+    if not proxy:
+        return ""
+    try:
+        norm = proxy
+        if norm.startswith("socks5://"):
+            norm = "socks5h://" + norm[len("socks5://"):]
+        from curl_cffi import requests as cffi_req
+        r = cffi_req.get(
+            "http://ip-api.com/json/?fields=query",
+            proxies={"http": norm, "https": norm},
+            impersonate="chrome110",
+            timeout=8,
+        )
+        return r.json().get("query", "")
+    except Exception as e:
+        logging.getLogger("registrar").warning(f"[exit_ip] 查询失败: {e}")
+        return ""
+
+
 def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
     run_id = uuid.uuid4().hex[:12]
     log_file = LOG_DIR / f"{run_id}.log"
     db.create_run(run_id, account["email"], str(log_file), options.get("proxy", ""))
+    # 注册前查一次出口 IP，供「注册结果」页展示每个号用的哪个 IP
+    if not options.get("exit_ip"):
+        options["exit_ip"] = _get_exit_ip(options.get("proxy", ""))
 
     q: queue.Queue = queue.Queue()
     with _lock:

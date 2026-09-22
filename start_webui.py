@@ -61,13 +61,32 @@ def main():
         except Exception:
             pass
 
-    uvicorn.run(
-        "webui.app:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level="info",
-    )
+    import socket as _socket
+
+    # 创建双栈 socket，支持 IPv4 + IPv6
+    bind_host = args.host
+    if bind_host == "::":
+        sock = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
+        sock.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 0)
+        # 双栈 bind 必须 SO_REUSEADDR：systemd restart 时旧 FIN-WAIT/TIME_WAIT
+        # 连接残留会导致 Address already in use 循环（2026-09-15 实测 restart 失败 ×N）
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        sock.bind((bind_host, args.port))
+        sock.listen()
+        uvicorn.run(
+            "webui.app:app",
+            fd=sock.fileno(),
+            reload=args.reload,
+            log_level="info",
+        )
+    else:
+        uvicorn.run(
+            "webui.app:app",
+            host=bind_host,
+            port=args.port,
+            reload=args.reload,
+            log_level="info",
+        )
 
 
 if __name__ == "__main__":

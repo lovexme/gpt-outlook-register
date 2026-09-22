@@ -138,6 +138,27 @@ _RE_TS_PARAM = re.compile(r"\bt=\d+\b")
 _RE_OTP6 = re.compile(r"(?<!#)(?<!\d)(\d{6})(?!\d)")
 
 
+def message_is_after(message: dict, issued_after: Optional[float]) -> bool:
+    """统一 OTP 时间过滤；无可解析时间的消息保守放行。"""
+    if issued_after is None:
+        return True
+    value = (message or {}).get("received_at") or (message or {}).get("receivedAt")
+    value = value or (message or {}).get("created_at") or (message or {}).get("timestamp")
+    if value in (None, ""):
+        return True
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 10**12:
+                ts /= 1000
+        else:
+            from datetime import datetime
+            ts = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return ts >= issued_after
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
 def extract_otp(raw: str, code_pattern: Optional[str] = None) -> Optional[str]:
     """从邮件原文提取 6 位 OTP。
 

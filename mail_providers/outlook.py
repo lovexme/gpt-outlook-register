@@ -20,6 +20,7 @@ import imaplib
 import json
 import logging
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -47,7 +48,8 @@ GRAPH_FOLDERS = ["inbox", "junkemail", "deleteditems"]
 
 IMAP_SERVERS = ["outlook.live.com", "outlook.office365.com"]
 
-_FROM_DOMAINS = ("openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open")
+_FROM_DOMAINS = ("openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open",
+                 "forwarded-by@duck.com")
 
 # 旧常量保留（外部可能 import）
 GRAPH_TOKEN_URL = TOKEN_ENDPOINTS[-1]
@@ -159,12 +161,40 @@ def fetch_otp_via_graph(
     deadline: float = 0,
     target_email: str = "",
 ) -> str:
-    """Graph API 轮询取 OTP。成功返回 6 位 OTP，认证失败抛 FatalOutlookMailError。"""
+    """Graph API 轮询取 OTP。成功返回 6 位 OTP，认证失败抛 FatalOutlookMailError。
+
+    并发安全：同邮箱（refresh_token 轮换竞争）串行化，不同邮箱并行。
+    """
     if not deadline:
         deadline = time.time() + max(60, timeout)
     if not threshold_ts:
         threshold_ts = time.time() - 300
+    with _fetch_lock_for(email_addr):
+        return _fetch_graph_locked(
+            email_addr, refresh_token, client_id, timeout, threshold_ts, deadline, target_email)
 
+
+def _fetch_lock_for(email_addr: str) -> threading.Lock:
+    """每个邮箱一把锁（进程内）：同一 outlook 号并发刷新会互踩 refresh_token 轮换，串行化。"""
+    lock = _FETCH_LOCKS.get(email_addr)
+    if lock is None:
+        lock = threading.Lock()
+        _FETCH_LOCKS[email_addr] = lock
+    return lock
+
+
+_FETCH_LOCKS: dict = {}
+
+
+def _fetch_graph_locked(
+    email_addr: str,
+    refresh_token: str,
+    client_id: str,
+    timeout: int,
+    threshold_ts: float,
+    deadline: float,
+    target_email: str,
+) -> str:
     data = _request_access_token(refresh_token, client_id, GRAPH_SCOPE)
     access_token = data["access_token"]
     cached_refresh = data.get("refresh_token", refresh_token)

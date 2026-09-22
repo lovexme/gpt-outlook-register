@@ -13,6 +13,9 @@ export const listRegistered = (params) =>
 export const getRegistered = (email) =>
   http.get(`/api/registered/${encodeURIComponent(email)}`)
 
+export const fetchTotp = (email) =>
+  http.post(`/api/registered/${encodeURIComponent(email)}/totp`, {})
+
 export const deleteRegistered = (email) =>
   http.delete(`/api/registered/${encodeURIComponent(email)}`)
 
@@ -25,14 +28,31 @@ export const exportRegistered = (payload) => http.post('/api/registered/export',
 
 export const checkPlus = (emails, proxy = '') =>
   http.post('/api/registered/check_plus', { emails, proxy })
+export const checkFiltered = (filter, search = '') =>
+  http.post('/api/registered/check_filtered', { filter, search })
+export const getPeriodicCheck = () => http.get('/api/registered/periodic_check')
+export const setPeriodicCheck = (payload) =>
+  http.post('/api/registered/periodic_check', payload)
 
 // 补 refresh：无 refresh_token 的号重跑注册
 export const listWithoutRefresh = () => http.get('/api/registered/without_refresh')
 export const refreshRefresh = (emails, proxy = '', otpTimeout = 10) =>
   http.post('/api/registered/refresh_refresh', { emails, proxy, otp_timeout: otpTimeout })
 
+// 刷新 AT：重登录换新 access_token 并纠正 plus 状态
+export const refreshAt = (emails, proxy = '') =>
+  http.post('/api/registered/refresh_at', { emails, proxy })
+
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })
+
+// 勾选批量推送：手动指定目标面板（cpa / sub2api / chatgpt2api），不受启用开关限制
+export const pushSelected = (emails, proxy = '', targets = ['cpa', 'sub2api', 'chatgpt2api']) =>
+  http.post('/api/registered/push_selected', { emails, proxy, targets })
+
+// ──────────────── 支付回调确认 ────────────────
+export const confirmPayment = (email, url) =>
+  http.post(`/api/registered/${encodeURIComponent(email)}/confirm_payment`, { url })
 
 // ──────────────── 自动跑号 auto-loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)
@@ -40,3 +60,5 @@ export const autoPause = () => http.post('/api/auto/pause')
 export const autoResume = () => http.post('/api/auto/resume')
 export const autoStop = () => http.post('/api/auto/stop')
 export const autoStatus = () => http.get('/api/auto/status')
+
+// ──────────────── 付款链接 ────────────────

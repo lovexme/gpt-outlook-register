@@ -1,0 +1,806 @@
+{
+  "results": {
+    "4": {
+      "code": "4",
+      "name": "Philippines",
+      "cost": 0.0275,
+      "stock": 7323,
+      "rented_attempts": 2,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "080fdd7616b1",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786492122.103533
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "5f9dc62510e4",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786492382.1681826
+        }
+      ],
+      "received": 0
+    },
+    "16": {
+      "code": "16",
+      "name": "United Kingdom",
+      "cost": 0.0413,
+      "stock": 3411,
+      "rented_attempts": 2,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "dbc896716a53",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786492612.2300549
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "9dab0f998684",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786492712.3471262
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "f395e6dd866e",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786492792.380834
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "注册完成但未获取有效凭证",
+          "run_id": "aa219182971a",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786493042.4449759
+        }
+      ],
+      "received": 0
+    },
+    "6": {
+      "code": "6",
+      "name": "Indonesia",
+      "cost": 0.0495,
+      "stock": 74539,
+      "rented_attempts": 2,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": true,
+          "status": "done",
+          "error": "",
+          "run_id": "0ae995266d63",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786493192.4919438
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "b177f49673d9",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786493262.5253994
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "7263e0421250",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786493352.5595
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": true,
+          "status": "done",
+          "error": "",
+          "run_id": "0c4c15774355",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786493472.6400094
+        }
+      ],
+      "received": 0
+    },
+    "73": {
+      "code": "73",
+      "name": "Brazil",
+      "cost": 0.0495,
+      "stock": 55123,
+      "rented_attempts": 2,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "8f009545f8d6",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786493622.6853569
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "0603053a1cc4",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786493852.7350705
+        }
+      ],
+      "received": 0
+    },
+    "33": {
+      "code": "33",
+      "name": "Colombia",
+      "cost": 0.055,
+      "stock": 16684,
+      "rented_attempts": 2,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "1a355a803b7c",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786493932.7694585
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "0a7b067a8be1",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786494012.7981808
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "2fbac89f66f0",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786494152.8373682
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "de6646297cd9",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786494232.9003215
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": true,
+          "status": "done",
+          "error": "",
+          "run_id": "d307419b9b72",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786494362.9391332
+        }
+      ],
+      "received": 0
+    },
+    "66": {
+      "code": "66",
+      "name": "Pakistan",
+      "cost": 0.055,
+      "stock": 16248,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "9ecc061f2ef0",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786496366.6289377
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "05f52e39560c",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786496456.6686337
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "6d44106e4ccb",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786496576.709917
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "79b6a02367b5",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786496676.7403054
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "373d4fd37ea2",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786496756.7623377
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "f43ff20ca3f1",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786496906.810162
+        }
+      ]
+    },
+    "41": {
+      "code": "41",
+      "name": "Cameroon",
+      "cost": 0.055,
+      "stock": 6554,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "d2a0741c2a6c",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786496986.8442557
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "434ecced3105",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786497106.877982
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "33f4b44c46a8",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786497226.9126425
+        }
+      ]
+    },
+    "2": {
+      "code": "2",
+      "name": "Kazakhstan",
+      "cost": 0.055,
+      "stock": 6215,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "1d0e4fbed9c2",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786497476.985007
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "注册完成但未获取有效凭证",
+          "run_id": "b5f5016a3675",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786497697.029864
+        }
+      ]
+    },
+    "117": {
+      "code": "117",
+      "name": "Portugal",
+      "cost": 0.055,
+      "stock": 5843,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "128ba0063122",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786497777.06605
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "5cde8b63f73c",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786497857.0969665
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "af2e8bd49b09",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786498107.1557786
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "8ed21685694b",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786498197.1922345
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "0d59667a1d9b",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786498427.2486587
+        }
+      ]
+    },
+    "25": {
+      "code": "25",
+      "name": "Laos",
+      "cost": 0.055,
+      "stock": 5422,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "920b79245c7e",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786498557.2852578
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "6883c9431fbd",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786498807.3444319
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "0482b14cb30e",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786498917.383597
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "faaf006f4591",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786498997.4114
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "19bfabbaf12a",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786499117.4570699
+        }
+      ]
+    },
+    "151": {
+      "code": "151",
+      "name": "Chile",
+      "cost": 0.055,
+      "stock": 3952,
+      "rented_attempts": 2,
+      "received": 1,
+      "runs": [
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "d1637f7f6a7e",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786499197.4915926
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "8990449419ea",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786499337.537078
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "1550b638b507",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786499407.5784104
+        },
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": true,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "3e47982babfa",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786499557.6267056
+        }
+      ]
+    },
+    "39": {
+      "code": "39",
+      "name": "Argentina",
+      "cost": 0.055,
+      "stock": 3274,
+      "rented_attempts": 2,
+      "received": 0,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "cacc2db41920",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786499677.661014
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "09da08d348f3",
+          "proxy": "socks5://127.0.0.1:1083",
+          "time": 1786499757.6939015
+        },
+        {
+          "rented": false,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "failed",
+          "error": "IMAP 登录失败: b'AUTHENTICATE failed.'",
+          "run_id": "350f067a2081",
+          "proxy": "http://127.0.0.1:7890",
+          "time": 1786499857.7294855
+        },
+        {
+          "rented": true,
+          "send_ok": false,
+          "received": false,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "55d1d961351a",
+          "proxy": "socks5://127.0.0.1:1081",
+          "time": 1786499977.804168
+        }
+      ]
+    },
+    "31": {
+      "code": "31",
+      "name": "South Africa",
+      "cost": 0.055,
+      "stock": 1964,
+      "rented_attempts": 1,
+      "received": 1,
+      "runs": [
+        {
+          "rented": true,
+          "send_ok": true,
+          "received": true,
+          "blocked": false,
+          "status": "done",
+          "error": "",
+          "run_id": "424f23f6f0a5",
+          "proxy": "socks5://127.0.0.1:1082",
+          "time": 1786500117.8429606
+        }
+      ]
+    }
+  },
+  "completed": false,
+  "candidates": [
+    {
+      "code": "4",
+      "name": "Philippines",
+      "cost": 0.0275,
+      "stock": 8737
+    },
+    {
+      "code": "16",
+      "name": "United Kingdom",
+      "cost": 0.0413,
+      "stock": 3757
+    },
+    {
+      "code": "6",
+      "name": "Indonesia",
+      "cost": 0.0495,
+      "stock": 69957
+    },
+    {
+      "code": "73",
+      "name": "Brazil",
+      "cost": 0.0495,
+      "stock": 57756
+    },
+    {
+      "code": "33",
+      "name": "Colombia",
+      "cost": 0.055,
+      "stock": 17431
+    },
+    {
+      "code": "66",
+      "name": "Pakistan",
+      "cost": 0.055,
+      "stock": 16248
+    },
+    {
+      "code": "41",
+      "name": "Cameroon",
+      "cost": 0.055,
+      "stock": 6554
+    },
+    {
+      "code": "2",
+      "name": "Kazakhstan",
+      "cost": 0.055,
+      "stock": 6215
+    },
+    {
+      "code": "117",
+      "name": "Portugal",
+      "cost": 0.055,
+      "stock": 5843
+    },
+    {
+      "code": "25",
+      "name": "Laos",
+      "cost": 0.055,
+      "stock": 5422
+    },
+    {
+      "code": "151",
+      "name": "Chile",
+      "cost": 0.055,
+      "stock": 3952
+    },
+    {
+      "code": "39",
+      "name": "Argentina",
+      "cost": 0.055,
+      "stock": 3274
+    },
+    {
+      "code": "31",
+      "name": "South Africa",
+      "cost": 0.055,
+      "stock": 1964
+    },
+    {
+      "code": "48",
+      "name": "Netherlands",
+      "cost": 0.0825,
+      "stock": 61574
+    },
+    {
+      "code": "50",
+      "name": "Austria",
+      "cost": 0.0825,
+      "stock": 61073
+    },
+    {
+      "code": "37",
+      "name": "Morocco",
+      "cost": 0.0825,
+      "stock": 48754
+    },
+    {
+      "code": "13",
+      "name": "Israel",
+      "cost": 0.0825,
+      "stock": 3078
+    },
+    {
+      "code": "42",
+      "name": "Chad",
+      "cost": 0.088,
+      "stock": 887
+    },
+    {
+      "code": "40",
+      "name": "Uzbekistan",
+      "cost": 0.099,
+      "stock": 92012
+    },
+    {
+      "code": "64",
+      "name": "Sri Lanka",
+      "cost": 0.099,
+      "stock": 3401
+    },
+    {
+      "code": "47",
+      "name": "Iraq",
+      "cost": 0.099,
+      "stock": 1366
+    },
+    {
+      "code": "61",
+      "name": "Senegal",
+      "cost": 0.099,
+      "stock": 1286
+    },
+    {
+      "code": "30",
+      "name": "Yemen",
+      "cost": 0.099,
+      "stock": 1139
+    },
+    {
+      "code": "72",
+      "name": "Mongolia",
+      "cost": 0.099,
+      "stock": 807
+    },
+    {
+      "code": "79",
+      "name": "Papua",
+      "cost": 0.099,
+      "stock": 100
+    }
+  ],
+  "proxy_idx": 17,
+  "proxy_index": 30
+}

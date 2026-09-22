@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-from .base import ConfigField, MailProvider, extract_otp, register
+from .base import ConfigField, MailProvider, extract_otp, message_is_after, register
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,10 @@ def _gen_local_part(rng: Optional[random.Random] = None, length: int = 10) -> st
 # OTP 抽取已上提到 base.extract_otp（与 outlook 共用同一套防误判规则）。
 # 保留旧名给可能的外部调用。
 _extract_otp = extract_otp
+
+
+# 域名轮询计数器（进程级）
+_DOMAIN_INDEX = [0]
 
 
 @register
@@ -78,7 +82,12 @@ class CFTempEmailProvider(MailProvider):
         ConfigField(
             "cf_domain", "收件域名",
             placeholder="example.com",
-            help="已配置 catch-all 的域名",
+            help="单域名：已配置 catch-all 的域名",
+        ),
+        ConfigField(
+            "cf_domains", "多域名（轮询）",
+            placeholder="dom1.com,dom2.com,dom3.com",
+            help="多域名逗号分隔，每次创建邮箱轮换一个（留空则用单域名）",
         ),
     ]
 
@@ -87,29 +96,38 @@ class CFTempEmailProvider(MailProvider):
         api_url: str,
         admin_token: str = "",
         domain: str = "",
+        domains: Optional[list[str]] = None,
         session=None,
+        proxy: str = "",
     ):
         if not api_url:
             raise ValueError("api_url 不能为空")
-        if not domain:
-            raise ValueError("domain 不能为空")
+        if not domain and not domains:
+            raise ValueError("domain 或 domains 不能同时为空")
         self.api_url = api_url.rstrip("/")
         self.admin_token = admin_token
         self.domain = domain
+        self._domains = domains or ([domain] if domain else [])
+        self._proxy = proxy
         self._jwt: str = ""
         self._current_email: str = ""
         self._seen_mail_ids: set = set()
         self._rng = random.Random()
         self.last_persona = None
 
-        # 用 curl_cffi 模拟 Chrome 指纹，过 CF Bot Fight Mode
+        # 用 requests 访问自有 Worker API（不需要 curl_cffi 的浏览器指纹模拟）
         if session is not None:
             self._session = session
         else:
             try:
-                from curl_cffi.requests import Session as CffiSession
-                self._session = CffiSession(impersonate="chrome136")
-                self._session.trust_env = False
+                import requests as req
+                s = req.Session()
+                s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                if proxy:
+                    # 强制 socks5h:// 让代理端解析 DNS（本地解析出 IPv6 代理连不上）
+                    _px = proxy.replace("socks5://", "socks5h://")
+                    s.proxies = {"http": _px, "https": _px}
+                self._session = s
             except ImportError:
                 self._session = None
 
@@ -119,13 +137,39 @@ class CFTempEmailProvider(MailProvider):
     def from_config(cls, settings: dict, account: Optional[dict] = None):
         api_url = (settings.get("cf_api_url") or "").strip()
         domain = (settings.get("cf_domain") or "").strip()
-        token = (settings.get("cf_admin_token") or "").strip()
-        if not api_url or not domain or not token:
+        # 支持多域名逗号分隔，每次创建邮箱轮换一个
+        raw_domains = (settings.get("cf_domains") or "").strip()
+        domains = [d.strip() for d in raw_domains.split(",") if d.strip()] if raw_domains else []
+        if not domain and not domains:
             raise RuntimeError(
-                "CF Temp Email 未配置完整（缺 api_url / domain / admin_token），"
+                "CF Temp Email 未配置域名（缺 cf_domain 或 cf_domains），"
                 "请去「邮箱配置」Tab 填写"
             )
-        return cls(api_url=api_url, admin_token=token, domain=domain)
+        if not domains:
+            domains = [domain]
+        token = (settings.get("cf_admin_token") or "").strip()
+        if not api_url:
+            raise RuntimeError(
+                "CF Temp Email 未配置 Worker 地址（缺 cf_api_url），"
+                "请去「邮箱配置」Tab 填写"
+            )
+        # workers.dev 域名国内直连不通，必须走代理
+        # 注册主流程注入的 proxy 优先，没有则从配置取兜底
+        proxy = (settings.get("proxy") or settings.get("cf_proxy") or "").strip()
+        if not proxy:
+            try:
+                import json as _json
+                import sqlite3 as _sq
+                _con = _sq.connect("/root/.openclaw/workspace/gpt-outlook-register/webui/webui.db")
+                _row = _con.execute("SELECT value FROM settings WHERE key='proxy_pool'").fetchone()
+                _con.close()
+                if _row:
+                    _pool = _json.loads(_row[0])
+                    if _pool:
+                        proxy = _pool[0]  # 取第一个可用代理
+            except Exception:
+                pass
+        return cls(api_url=api_url, admin_token=token, domain=domains[0], domains=domains, proxy=proxy)
 
     # ──────────────────────── HTTP 工具 ────────────────────────
 
@@ -161,8 +205,8 @@ class CFTempEmailProvider(MailProvider):
 
         # urllib 兜底
         if params:
-            import urllib.parse
-            qs = urllib.parse.urlencode(params)
+            from urllib.parse import urlencode
+            qs = urlencode(params)
             url = f"{url}?{qs}"
         body = _json.dumps(json_body).encode() if json_body is not None else None
         req = urllib.request.Request(url, data=body, headers=headers, method=m)
@@ -198,13 +242,22 @@ class CFTempEmailProvider(MailProvider):
         关键参数（来自 any-auto-register 实战）：
           enablePrefix=True   必须，否则部分部署会返回 400
           name=<10位随机>     邮箱前缀
-          domain=<主人域名>   catch-all 收件域
+          domain=<主人域名>   catch-all 收件域（多域名时轮换）
         """
         local = _gen_local_part(self._rng, length=10)
+        # 多域名轮询：每次创建换一个域名，分散 OpenAI 对单域名的识别
+        if len(self._domains) > 1:
+            idx = _DOMAIN_INDEX[0] % len(self._domains)
+            _DOMAIN_INDEX[0] += 1
+            use_domain = self._domains[idx]
+            self.domain = use_domain
+            logger.info(f"[cf_temp] 域名轮询使用 #{idx}: {use_domain}")
+        else:
+            use_domain = self._domains[0]
         payload = {
             "enablePrefix": True,
             "name": local,
-            "domain": self.domain,
+            "domain": use_domain,
         }
         resp = self._request("POST", "/admin/new_address", json=payload, timeout=15)
         status = getattr(resp, "status_code", 0)
@@ -273,8 +326,15 @@ class CFTempEmailProvider(MailProvider):
             initial_mails = self._get_mails(email_addr)
             for m in initial_mails:
                 mid = str(m.get("id", ""))
-                if mid:
-                    self._seen_mail_ids.add(mid)
+                if not mid:
+                    continue
+                self._seen_mail_ids.add(mid)
+                # 初始拉取时邮件可能已经到达，必须提取 OTP 不能只加 seen
+                raw = str(m.get("raw") or "")
+                otp = extract_otp(raw)
+                if otp:
+                    logger.info(f"[cf_temp] ✅ OTP={otp} from mail id={mid} (初始拉取)")
+                    return otp
             logger.debug(f"[cf_temp] 初始已有邮件 {len(self._seen_mail_ids)} 封，跳过")
         except Exception as e:
             logger.warning(f"[cf_temp] 初始邮件列表拉取异常: {e}")
@@ -289,6 +349,8 @@ class CFTempEmailProvider(MailProvider):
                         continue
                     self._seen_mail_ids.add(mid)
 
+                    if not message_is_after(mail, issued_after):
+                        continue
                     raw = str(mail.get("raw") or "")
                     otp = extract_otp(raw)
                     if otp:

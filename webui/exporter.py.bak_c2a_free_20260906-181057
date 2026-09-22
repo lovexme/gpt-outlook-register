@@ -1,0 +1,800 @@
+"""导出注册凭证到 CPA / SUB2API 面板（路线 2 实现）。
+
+参考 zc-zhangchen/any-auto-register 的 platforms/chatgpt/cpa_upload.py 和 sub2api_upload.py。
+
+核心改造：
+  ★ 导出前先用 refresh_token 调 https://auth.openai.com/oauth/token 换新的 Codex
+    风格 access_token（client_id=app_EMoamEEZ73f0CkXaXp7hrann）。
+    主项目 run_register 末尾会用 get_auth_session() 把 Codex access_token 覆盖
+    成 ChatGPT 网页 NextAuth 风格，但 NextAuth 风格的 token 在 CPA/SUB2API 不可用，
+    所以这里单独刷新。
+
+两种导出目标：
+  1. CPA：multipart 文件上传 → POST /v0/management/auth-files
+     Bearer 鉴权，文件名 {email}.json
+  2. SUB2API：直接 POST /api/v1/admin/accounts
+     x-api-key 鉴权（无登录流程）
+
+全部用 curl_cffi impersonate="chrome110" 模拟浏览器 TLS 指纹，绕过 CF Bot 拦截。
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# OpenAI / Codex 常量
+OPENAI_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_SCOPE = "openid email profile offline_access"
+
+# 默认值
+DEFAULT_TIMEOUT = 30
+DEFAULT_SUB2API_GROUP_IDS = [2]
+SUB2API_DEFAULT_EXPIRES_IN = 863999  # 跟 any-auto-register 一致
+MAX_ATTEMPTS = 3
+RETRY_DELAYS_S = [3.0, 7.0]
+
+
+# ──────────────────────── 工具函数 ────────────────────────
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """解析 JWT payload 段。失败返回 {}。"""
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return {}
+        p = parts[1]
+        pad = (4 - len(p) % 4) % 4
+        data = json.loads(base64.urlsafe_b64decode(p + "=" * pad))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _b64url_json(d: dict) -> str:
+    raw = json.dumps(d, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _get_auth(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    auth_info = payload.get("https://api.openai.com/auth")
+    return auth_info if isinstance(auth_info, dict) else {}
+
+
+def _get_profile(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    p = payload.get("https://api.openai.com/profile")
+    return p if isinstance(p, dict) else {}
+
+
+def _first(*values) -> str:
+    for v in values:
+        s = str(v or "").strip()
+        if s:
+            return s
+    return ""
+
+
+def _parse_group_ids(raw: Any, fallback: list[int] | None = None) -> list[int]:
+    """支持字符串 '1,2'、列表、单值等格式，返回 list[int]。"""
+    if isinstance(raw, str):
+        candidates = [s.strip() for s in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    elif raw is None:
+        candidates = []
+    else:
+        candidates = [raw]
+
+    out: list[int] = []
+    for item in candidates:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            out.append(int(text))
+        except ValueError:
+            continue
+    return out or list(fallback or DEFAULT_SUB2API_GROUP_IDS)
+
+
+def _import_cffi():
+    """惰性 import curl_cffi。失败抛 RuntimeError。"""
+    try:
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests
+    except ImportError as e:
+        raise RuntimeError(f"curl_cffi 未安装，无法导出（pip install curl-cffi）: {e}")
+
+
+def _import_cffi_mime():
+    """惰性 import CurlMime。"""
+    try:
+        from curl_cffi import CurlMime
+        return CurlMime
+    except ImportError as e:
+        raise RuntimeError(f"curl_cffi CurlMime 不可用: {e}")
+
+
+# ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
+
+
+def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """用 Codex refresh_token 换一组新的 access_token / id_token / refresh_token(滚动)。
+
+    参考 any-auto-register/platforms/chatgpt/token_refresh.py 风格。
+
+    返回 OpenAI 原始响应 dict：
+        {access_token, refresh_token, id_token, expires_in, token_type}
+    失败抛 RuntimeError。
+    """
+    rt = str(refresh_token or "").strip()
+    if not rt:
+        raise RuntimeError("缺少 refresh_token，无法刷新 Codex access_token")
+
+    cffi = _import_cffi()
+    proxy = (
+        os.environ.get("OPENAI_EXPORT_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or "http://127.0.0.1:7890"
+    ).strip()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    body = {
+        "grant_type": "refresh_token",
+        "client_id": CODEX_CLIENT_ID,
+        "refresh_token": rt,
+        "scope": CODEX_SCOPE,
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "Origin": "https://auth.openai.com",
+        "Referer": "https://auth.openai.com/",
+    }
+
+    resp = cffi.post(
+        OPENAI_TOKEN_ENDPOINT,
+        headers=headers,
+        data=body,
+        proxies=proxies,
+        verify=False,
+        timeout=timeout,
+        impersonate="chrome110",
+    )
+
+    if resp.status_code != 200:
+        body_text = ""
+        try:
+            body_text = (resp.text or "")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"OpenAI token 刷新失败 HTTP {resp.status_code}: {body_text}"
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError("OpenAI token 刷新返回非 JSON")
+
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise RuntimeError(f"OpenAI token 刷新返回无 access_token: {str(data)[:200]}")
+
+    return data
+
+
+def _persist_rotated_refresh_token(cred: dict, fresh: dict) -> None:
+    """RT rotation 后只原子更新 DB refresh_token，保留其它字段/extra_json。"""
+    old_rt = str(cred.get("refresh_token") or "").strip()
+    new_rt = str(fresh.get("refresh_token") or "").strip()
+    email = str(cred.get("email") or "").strip().lower()
+    if new_rt and new_rt != old_rt and email:
+        from . import db
+        db.update_auth_tokens(email, refresh_token=new_rt)
+
+
+def _safe_response_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _business_response_error(data) -> str:
+    """识别 HTTP 2xx 但响应体明确表示业务失败。"""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("ok") is False or data.get("success") is False:
+        return str(data.get("message") or data.get("error") or data.get("detail") or "业务失败")
+    err = data.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("detail") or "业务失败")
+    return str(err) if err else ""
+
+
+
+def _build_compat_id_token(*, access_token: str, email: str) -> str:
+    """access_token 缺 id_token 时构造一个本地解析用的兼容 token。
+
+    完全照 any-auto-register/cpa_upload.py:_build_compat_id_token 实现。
+    注意：签名是固定字符串，仅供 CPA 等不校验签名的本地环境解析。
+    """
+    payload = _decode_jwt_payload(access_token)
+    if not payload:
+        return ""
+
+    auth_info = _get_auth(payload)
+    profile = _get_profile(payload)
+    email_from_token = (profile.get("email") or payload.get("email") or email or "").strip()
+    email_verified = bool(profile.get("email_verified", payload.get("email_verified", True)))
+    account_id = str(auth_info.get("chatgpt_account_id") or auth_info.get("account_id") or "").strip()
+    user_id = str(
+        auth_info.get("chatgpt_user_id")
+        or auth_info.get("user_id")
+        or payload.get("sub")
+        or ""
+    ).strip()
+    iat = int(payload.get("iat") or 0)
+    exp = int(payload.get("exp") or 0)
+    auth_time = int(payload.get("pwd_auth_time") or payload.get("auth_time") or iat or 0)
+    session_id = str(
+        payload.get("session_id")
+        or f"compat_session_{(account_id or user_id or 'unknown').replace('-', '')[:24]}"
+    ).strip()
+    plan_type = str(auth_info.get("chatgpt_plan_type") or "free").strip() or "free"
+    organization_id = str(
+        auth_info.get("organization_id")
+        or f"org-{hashlib.sha1((account_id or email_from_token or user_id).encode('utf-8')).hexdigest()[:24]}"
+    )
+    project_id = str(
+        auth_info.get("project_id")
+        or f"proj_{hashlib.sha1((organization_id + ':' + (account_id or user_id)).encode('utf-8')).hexdigest()[:24]}"
+    )
+
+    compat_auth = {
+        "chatgpt_account_id": account_id,
+        "chatgpt_plan_type": plan_type,
+        "chatgpt_subscription_active_start": auth_info.get("chatgpt_subscription_active_start"),
+        "chatgpt_subscription_active_until": auth_info.get("chatgpt_subscription_active_until"),
+        "chatgpt_subscription_last_checked": auth_info.get("chatgpt_subscription_last_checked"),
+        "chatgpt_user_id": user_id,
+        "completed_platform_onboarding": bool(auth_info.get("completed_platform_onboarding", False)),
+        "groups": auth_info.get("groups", []),
+        "is_org_owner": bool(auth_info.get("is_org_owner", True)),
+        "localhost": bool(auth_info.get("localhost", True)),
+        "organization_id": organization_id,
+        "organizations": auth_info.get("organizations") or [
+            {"id": organization_id, "is_default": True, "role": "owner", "title": "Personal"}
+        ],
+        "project_id": project_id,
+        "user_id": str(auth_info.get("user_id") or user_id or "").strip(),
+    }
+
+    compat_payload = {
+        "amr": ["pwd", "otp", "mfa", "urn:openai:amr:otp_email"],
+        "at_hash": hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:22],
+        "aud": [CODEX_CLIENT_ID],
+        "auth_provider": "password",
+        "auth_time": auth_time,
+        "email": email_from_token,
+        "email_verified": email_verified,
+        "exp": exp,
+        "https://api.openai.com/auth": compat_auth,
+        "iat": iat,
+        "iss": payload.get("iss") or "https://auth.openai.com",
+        "jti": f"compat-{hashlib.sha1(access_token.encode('utf-8')).hexdigest()[:32]}",
+        "name": email_from_token or "OpenAI User",
+        "rat": auth_time,
+        "sid": session_id,
+        "sub": payload.get("sub") or user_id,
+    }
+
+    header = {"alg": "RS256", "typ": "JWT", "kid": "compat"}
+    signature = base64.urlsafe_b64encode(b"compat_signature_for_cpa_parsing_only").decode("ascii").rstrip("=")
+    return f"{_b64url_json(header)}.{_b64url_json(compat_payload)}.{signature}"
+
+
+def build_cpa_token_json(cred: dict) -> dict:
+    """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
+
+    严格对齐 any-auto-register/cpa_upload.py:generate_token_json：
+    8 个字段，UTC+8 时区。
+    """
+    access_token = str(cred.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("未读取到可导入的 access_token")
+    refresh_token = str(cred.get("refresh_token") or "").strip()
+    id_token = str(cred.get("id_token") or "").strip()
+    email = str(cred.get("email") or "").strip()
+
+    if not id_token:
+        id_token = _build_compat_id_token(access_token=access_token, email=email)
+
+    payload = _decode_jwt_payload(access_token)
+    auth_info = _get_auth(payload)
+    account_id = str(auth_info.get("chatgpt_account_id") or "").strip()
+
+    tz_cn = timezone(timedelta(hours=8))
+    expired_str = ""
+    exp = payload.get("exp")
+    if isinstance(exp, int) and exp > 0:
+        expired_str = datetime.fromtimestamp(exp, tz=tz_cn).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    last_refresh = datetime.now(tz=tz_cn).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+    return {
+        "type": "codex",
+        "email": email,
+        "expired": expired_str,
+        "id_token": id_token,
+        "account_id": account_id,
+        "access_token": access_token,
+        "last_refresh": last_refresh,
+        "refresh_token": refresh_token,
+    }
+
+
+# ──────────────────────── CPA：上传 ────────────────────────
+
+
+def export_to_cpa(cred: dict, cfg: dict, *,
+                    log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """CPA multipart 上传。"""
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+
+    api_url = (cfg.get("cpa_url") or "").rstrip("/").strip()
+    api_key = (cfg.get("cpa_mgmt_key") or "").strip()
+    timeout = int(cfg.get("cpa_timeout") or DEFAULT_TIMEOUT)
+    if not api_url:
+        raise RuntimeError("CPA 未配置 URL")
+    if not api_key:
+        raise RuntimeError("CPA 未配置管理密钥")
+
+    cffi = _import_cffi()
+    CurlMime = _import_cffi_mime()
+
+    token_data = build_cpa_token_json(cred)
+    email = token_data.get("email") or "unknown"
+    filename = f"{email}.json"
+    file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
+    upload_url = f"{api_url}/v0/management/auth-files"
+    # CLIProxyAPI 官方文档：两种 header 都接受。同时发以应对不同版本/部署的解析差异。
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Management-Key": api_key,
+    }
+
+    log(
+        f"[CPA] 上传目标: {upload_url}  "
+        f"文件名={filename}  内容大小={len(file_content)}B  "
+        f"含 access_token={'是' if token_data.get('access_token') else '否'}  "
+        f"含 refresh_token={'是' if token_data.get('refresh_token') else '否'}  "
+        f"含 id_token={'是' if token_data.get('id_token') else '否'}",
+        "info",
+    )
+
+    last_err = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        mime = None
+        try:
+            log(f"[CPA] 第 {attempt}/{MAX_ATTEMPTS} 次 multipart 上传 {filename}...", "info")
+            mime = CurlMime()
+            mime.addpart(
+                name="file",
+                data=file_content,
+                filename=filename,
+                content_type="application/json",
+            )
+            resp = cffi.post(
+                upload_url,
+                multipart=mime,
+                headers=headers,
+                proxies=None,
+                verify=False,
+                timeout=timeout,
+                impersonate="chrome110",
+            )
+            # 详细日志：HTTP 状态 + 响应体
+            try:
+                body_preview = (resp.text or "")[:400]
+            except Exception:
+                body_preview = "(无法读取响应体)"
+            log(
+                f"[CPA] 服务器响应: HTTP {resp.status_code}  body={body_preview!r}",
+                "info" if resp.status_code in (200, 201) else "warn",
+            )
+            if resp.status_code in (200, 201):
+                log(f"[CPA] ✅ 上传成功 {filename}", "ok")
+                return {"ok": True, "status": "accepted", "email": email, "file_name": filename,
+                        "message": f"CPA accepted: {filename}"}
+            msg = f"HTTP {resp.status_code}"
+            try:
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    msg = str(detail.get("message") or detail.get("error") or detail.get("detail") or msg)
+            except Exception:
+                msg = f"{msg}: {body_preview}"
+            last_err = msg
+            # 失败时也打详细日志（即使 4xx 不重试，也要让主人看到原因）
+            log(f"[CPA] ❌ 上传失败: {msg}", "error")
+            if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[CPA] 第 {attempt} 次失败 ({msg})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": msg, "email": email, "file_name": filename}
+        except Exception as e:
+            last_err = str(e)
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[CPA] 第 {attempt} 次异常 ({e})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": str(e), "email": email, "file_name": filename}
+        finally:
+            if mime is not None:
+                try:
+                    mime.close()
+                except Exception:
+                    pass
+    return {"ok": False, "error": last_err or "重试耗尽", "email": email, "file_name": filename}
+
+
+# ──────────────────────── SUB2API：构建 payload ────────────────────────
+
+
+def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
+    """构建 SUB2API POST /api/v1/admin/accounts 的 body。
+
+    严格对齐 any-auto-register/sub2api_upload.py:_build_sub2api_account_payload。
+    """
+    access_token = str(cred.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("未读取到可导入的 access_token")
+    refresh_token = str(cred.get("refresh_token") or "").strip()
+    id_token = str(cred.get("id_token") or "").strip()
+    email = str(cred.get("email") or "").strip()
+
+    access_payload = _decode_jwt_payload(access_token)
+    access_auth = _get_auth(access_payload)
+
+    expires_at = access_payload.get("exp")
+    if not isinstance(expires_at, int) or expires_at <= 0:
+        expires_at = int(time.time()) + SUB2API_DEFAULT_EXPIRES_IN
+
+    # organization_id 优先从 id_token 抽（更准），fallback 从 access_token
+    id_auth = _get_auth(_decode_jwt_payload(id_token))
+    organization_id = str(id_auth.get("organization_id") or "").strip()
+    if not organization_id:
+        orgs = id_auth.get("organizations") or []
+        if isinstance(orgs, list):
+            for o in orgs:
+                if isinstance(o, dict):
+                    organization_id = str(o.get("id") or "").strip()
+                    if organization_id:
+                        break
+    if not organization_id:
+        organization_id = str(access_auth.get("organization_id") or access_auth.get("poid") or "").strip()
+
+    client_id = str(
+        cred.get("client_id") or access_payload.get("client_id") or CODEX_CLIENT_ID
+    ).strip() or CODEX_CLIENT_ID
+
+    chatgpt_account_id = str(
+        access_auth.get("chatgpt_account_id") or cred.get("account_id") or ""
+    ).strip()
+    chatgpt_user_id = str(access_auth.get("chatgpt_user_id") or "").strip()
+
+    return {
+        "name": email,
+        "notes": "",
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": SUB2API_DEFAULT_EXPIRES_IN,
+            "expires_at": expires_at,
+            "chatgpt_account_id": chatgpt_account_id,
+            "chatgpt_user_id": chatgpt_user_id,
+            "organization_id": organization_id,
+            "client_id": client_id,
+            "id_token": id_token,
+        },
+        "extra": {"email": email},
+        "group_ids": list(group_ids) if group_ids else list(DEFAULT_SUB2API_GROUP_IDS),
+        "concurrency": 10,
+        "priority": 1,
+        "auto_pause_on_expired": True,
+    }
+
+
+# ──────────────────────── SUB2API：上传 ────────────────────────
+
+
+def export_to_sub2api(cred: dict, cfg: dict, *,
+                        log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """SUB2API x-api-key 直连上传（无登录流程）。"""
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+
+    api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
+    api_key = (cfg.get("sub2api_api_key") or "").strip()
+    if not api_url:
+        raise RuntimeError("SUB2API 未配置 URL")
+    if not api_key:
+        raise RuntimeError("SUB2API 未配置 API Key")
+
+    group_ids = _parse_group_ids(cfg.get("sub2api_group_ids"))
+    timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+
+    payload = build_sub2api_payload(cred, group_ids)
+    email = payload.get("name") or "unknown"
+    url = f"{api_url}/api/v1/admin/accounts"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{api_url}/admin/accounts",
+        "x-api-key": api_key,
+    }
+
+    last_err = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            log(
+                f"[SUB2API] 第 {attempt}/{MAX_ATTEMPTS} 次上传 {email} "
+                f"(group_ids={group_ids})...",
+                "info",
+            )
+            resp = cffi.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=None,
+                verify=False,
+                timeout=timeout,
+                impersonate="chrome110",
+            )
+            if resp.status_code in (200, 201):
+                new_id = ""
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        new_id = str(data.get("id") or data.get("ID") or "").strip()
+                except Exception:
+                    pass
+                log(f"[SUB2API] ✅ 上传成功 {email} (id={new_id or 'unknown'})", "ok")
+                return {"ok": True, "status": "accepted", "email": email, "account_id": new_id,
+                        "message": f"SUB2API accepted #{new_id or 'unknown'}"}
+            msg = f"HTTP {resp.status_code}"
+            try:
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    msg = str(
+                        detail.get("message") or detail.get("msg")
+                        or detail.get("error") or msg
+                    )
+            except Exception:
+                msg = f"{msg} - {(resp.text or '')[:200]}"
+            last_err = msg
+            if attempt < MAX_ATTEMPTS and resp.status_code >= 500:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[SUB2API] 第 {attempt} 次失败 ({msg})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": msg, "email": email}
+        except Exception as e:
+            last_err = str(e)
+            if attempt < MAX_ATTEMPTS:
+                delay = RETRY_DELAYS_S[attempt - 1]
+                log(f"[SUB2API] 第 {attempt} 次异常 ({e})，{delay:.0f}s 后重试", "warn")
+                time.sleep(delay)
+                continue
+            return {"ok": False, "error": str(e), "email": email}
+    return {"ok": False, "error": last_err or "重试耗尽", "email": email}
+
+
+def _fetch_chatgpt_session_access_token(cred: dict, *, proxy: str = "") -> dict:
+    """没有 RT 时，用现有 session/cookie/AT 请求 chatgpt.com session 取 access_token。"""
+    cffi = _import_cffi()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://chatgpt.com/",
+        "Origin": "https://chatgpt.com",
+    }
+    cookie_header = str(cred.get("cookie_header") or "").strip()
+    session_token = str(cred.get("session_token") or "").strip()
+    access_token = str(cred.get("access_token") or "").strip()
+    if session_token and "__Secure-next-auth.session-token=" not in cookie_header:
+        cookie_header = (cookie_header + "; " if cookie_header else "") + \
+            f"__Secure-next-auth.session-token={session_token}"
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    p = str(proxy or "").strip()
+    proxies = {"http": p, "https": p} if p else None
+    resp = cffi.get(
+        "https://chatgpt.com/api/auth/session",
+        headers=headers,
+        proxies=proxies,
+        verify=False,
+        timeout=30,
+        impersonate="chrome110",
+    )
+    data = _safe_response_json(resp)
+    if resp.status_code != 200 or not isinstance(data, dict):
+        raise RuntimeError(f"chatgpt.com session 请求失败 HTTP {resp.status_code}")
+    new_at = str(data.get("accessToken") or data.get("access_token") or "").strip()
+    if not new_at:
+        raise RuntimeError("chatgpt.com session 未返回 access_token")
+    return {
+        "access_token": new_at,
+        "id_token": str(data.get("idToken") or data.get("id_token") or "").strip(),
+        "session_token": session_token,
+        "cookie_header": cookie_header,
+    }
+
+
+def test_chatgpt2api(cfg: dict) -> dict:
+    """测试本机 ChatGPT2API 管理接口鉴权，不导入账号。"""
+    api_url = (cfg.get("c2a_url") or "http://127.0.0.1:8059").rstrip("/").strip()
+    api_key = (cfg.get("c2a_api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("ChatGPT2API 未配置 API Key")
+    timeout = int(cfg.get("c2a_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+    resp = cffi.get(
+        f"{api_url}/api/accounts",
+        headers={"Authorization": f"Bearer {api_key}"},
+        proxies=None, verify=False, timeout=timeout, impersonate="chrome110",
+    )
+    if resp.status_code == 200:
+        data = _safe_response_json(resp)
+        if isinstance(data, dict) and _business_response_error(data):
+            raise RuntimeError(f"ChatGPT2API 业务失败：{_business_response_error(data)}")
+        return {"ok": True, "message": "ChatGPT2API 连通正常"}
+    if resp.status_code in (401, 403):
+        raise RuntimeError(f"ChatGPT2API 鉴权失败 (HTTP {resp.status_code})，请检查 API Key")
+    raise RuntimeError(f"ChatGPT2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+
+
+def build_chatgpt2api_payload(cred: dict) -> dict:
+    """构建本机 ChatGPT2API /api/accounts 的账号导入 payload。"""
+    access_token = str(cred.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("未读取到可导入的 access_token")
+    return {"accounts": [{
+        "access_token": access_token,
+        "refresh_token": str(cred.get("refresh_token") or "").strip(),
+        "id_token": str(cred.get("id_token") or "").strip(),
+        "email": str(cred.get("email") or "").strip(),
+        "source_type": "codex",
+        "type": "codex",
+        "status": "正常",
+    }]}
+
+
+def export_to_chatgpt2api(cred: dict, cfg: dict, *,
+                          proxy: str = "",
+                          log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """导入一个账号到本机 ChatGPT2API。"""
+    api_url = (cfg.get("c2a_url") or "http://127.0.0.1:8059").rstrip("/").strip()
+    api_key = (cfg.get("c2a_api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("ChatGPT2API 未配置 API Key")
+    timeout = int(cfg.get("c2a_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+    payload = build_chatgpt2api_payload(cred)
+    email = payload["accounts"][0].get("email") or "unknown"
+    p = str(proxy or "").strip()
+    # 本机 ChatGPT2API 不能通过 SOCKS5 代理访问 127.0.0.1；远程地址才使用页面代理。
+    local_target = api_url.startswith(("http://127.0.0.1:", "http://localhost:", "http://[::1]:"))
+    proxies = None if local_target else ({"http": p, "https": p} if p else None)
+    resp = cffi.post(
+        f"{api_url}/api/accounts",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload, proxies=proxies, verify=False, timeout=timeout, impersonate="chrome110",
+    )
+    data = _safe_response_json(resp)
+    if resp.status_code not in (200, 201):
+        detail = data if isinstance(data, dict) else (resp.text or "")[:200]
+        return {"ok": False, "email": email, "error": f"HTTP {resp.status_code}: {detail}"}
+    if isinstance(data, dict) and _business_response_error(data):
+        return {"ok": False, "email": email, "error": str(_business_response_error(data))}
+    return {"ok": True, "email": email, "message": "ChatGPT2API 导入成功", "response": data}
+
+
+# ──────────────────────── 统一入口（注册完成后调用） ────────────────────────
+
+
+def run_exports(cred: dict, *,
+                  cpa_cfg: Optional[dict] = None,
+                  sub2api_cfg: Optional[dict] = None,
+                  chatgpt2api_cfg: Optional[dict] = None,
+                  proxy: str = "",
+                  log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """注册完成后的可选导出入口。
+
+    - CPA 严禁无 RT 账号：没有 refresh_token 直接跳过 CPA（skipped_no_rt），不请求 session、不上传。
+    - SUB2API / ChatGPT2API 无 RT 也推：无 RT 时通过 chatgpt.com session 获取 access_token 再上传。
+    - 有 RT 直接用现有凭证，不调 refresh_token rotation。
+    """
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+    out: dict = {"cpa": None, "sub2api": None, "chatgpt2api": None, "any_attempted": False}
+
+    cpa_on = bool(cpa_cfg and cpa_cfg.get("enabled"))
+    sub2_on = bool(sub2api_cfg and sub2api_cfg.get("enabled"))
+    c2a_on = bool(chatgpt2api_cfg and chatgpt2api_cfg.get("enabled"))
+    if not (cpa_on or sub2_on or c2a_on):
+        return out
+
+    has_rt = bool(cred.get("refresh_token"))
+
+    # 无 RT 时，只有 SUB2API / ChatGPT2API 需要 chatgpt.com session 兜底 access_token；
+    # CPA 严禁无 RT，不参与 session 兜底。
+    session_error = ""
+    if not has_rt and (sub2_on or c2a_on):
+        try:
+            log("[exporter] 无 refresh_token，调用 chatgpt.com session 获取 access_token...", "info")
+            session_cred = _fetch_chatgpt_session_access_token(cred, proxy=proxy)
+            cred = {**cred, **session_cred}
+            log("[exporter] ✅ chatgpt.com session access_token 获取成功", "ok")
+        except Exception as e:
+            session_error = f"chatgpt.com session 获取失败，未获得新的可用 access_token: {e}"
+            log(f"[exporter] ❌ {session_error}", "error")
+
+    # CPA：只接受有 refresh_token 的账号。
+    if cpa_on:
+        out["any_attempted"] = True
+        if not has_rt:
+            out["cpa"] = {"ok": False, "status": "skipped", "skipped_no_rt": True,
+                          "error": "无 refresh_token，CPA 严禁无 RT 账号，已跳过"}
+            log("[CPA] 无 refresh_token，跳过（CPA 严禁无 RT）", "warn")
+        elif cred.get("access_token"):
+            try:
+                out["cpa"] = export_to_cpa(cred, cpa_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[CPA] 导出异常: {e}", "error")
+                out["cpa"] = {"ok": False, "error": str(e)}
+        else:
+            out["cpa"] = {"ok": False, "error": "有 RT 但未获取到 access_token，CPA 未上传", "skipped_no_token": True}
+
+    if sub2_on:
+        out["any_attempted"] = True
+        if cred.get("access_token") and not session_error:
+            try:
+                out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[SUB2API] 导出异常: {e}", "error")
+                out["sub2api"] = {"ok": False, "error": str(e)}
+        else:
+            out["sub2api"] = {"ok": False, "error": session_error or "未获取到 access_token，SUB2API 未上传", "skipped_no_token": True}
+
+    if c2a_on:
+        out["any_attempted"] = True
+        if cred.get("access_token") and not session_error:
+            try:
+                out["chatgpt2api"] = export_to_chatgpt2api(cred, chatgpt2api_cfg, proxy=proxy, log_fn=log)
+            except Exception as e:
+                log(f"[ChatGPT2API] 导出异常: {e}", "error")
+                out["chatgpt2api"] = {"ok": False, "error": str(e)}
+        else:
+            out["chatgpt2api"] = {"ok": False, "error": session_error or "未获取到 access_token，ChatGPT2API 未上传", "skipped_no_token": True}
+
+    return out

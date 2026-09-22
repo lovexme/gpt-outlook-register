@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
+import queue
+import threading
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,6 +29,41 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, export_formats, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+
+# ── IP 国家代码缓存 ──
+_ip_country_cache: dict[str, str] = {}
+_ip_country_lock = threading.Lock()
+
+
+def _resolve_ip_countries(ips: list[str]) -> dict[str, str]:
+    """批量查询 IP 国家代码（带内存缓存），返回 {ip: countryCode}。
+
+    查询慢/失败时返回已有缓存或空，绝不让调用方挂起 —— 面板列表页
+    不能因为 ip-api.com 抽风就卡死。
+    """
+    with _ip_country_lock:
+        unknown = [ip for ip in ips if ip and ip not in _ip_country_cache]
+        if unknown:
+            # 去重，最多测 20 个
+            unknown = list(dict.fromkeys(unknown))[:20]
+            try:
+                import requests
+                for i in range(0, len(unknown), 20):
+                    batch = unknown[i:i + 20]
+                    r = requests.post(
+                        "http://ip-api.com/batch",
+                        json=[{"query": ip, "fields": "query,countryCode"} for ip in batch],
+                        timeout=3,  # 严格超时：3 秒查不到就放弃，页面不卡
+                    )
+                    if r.ok:
+                        for item in r.json():
+                            q = item.get("query", "")
+                            cc = item.get("countryCode", "")
+                            if q and cc:
+                                _ip_country_cache[q] = cc
+            except Exception:
+                pass
+        return {ip: _ip_country_cache.get(ip, "") for ip in ips if ip}
 from .proxy_health import get_checker as get_proxy_health_checker  # noqa: E402
 from mail_providers import (  # noqa: E402
     ImportValidationError,
@@ -49,6 +87,194 @@ try:
     get_proxy_health_checker().start()
 except Exception as _e:
     logging.getLogger("webui").warning(f"[startup] 代理健康检查启动失败: {_e}")
+
+
+# ──────────────────────── 定时套餐检测 + 清理 ────────────────────────
+
+_CHECK_PLUS_CONCURRENCY = 20  # 并发数
+
+
+def _periodic_check_enabled() -> bool:
+    """读 DB：定时检测开关（默认开）。"""
+    return db.get_setting("periodic_check_enabled", "1") == "1"
+
+
+def _periodic_check_interval() -> int:
+    """读 DB：定时检测间隔秒数（默认 1 小时，下限 10 分钟防误设）。"""
+    try:
+        return max(600, int(db.get_setting("periodic_check_interval", "3600")))
+    except (TypeError, ValueError):
+        return 3600
+
+
+def _get_check_proxies() -> list[str]:
+    """从缓存获取可用代理池，缓存过期(<15min)或可用代理为0时重新扫描。"""
+    from . import db as _db
+    import json as _json, time as _time
+    pool_raw = _db.get_setting("proxy_pool", "[]")
+    try:
+        pool = _json.loads(pool_raw)
+    except Exception:
+        pool = []
+    if not pool:
+        return []
+
+    health_raw = _db.get_setting("proxy_health", "{}")
+    try:
+        health = _json.loads(health_raw) if health_raw else {}
+    except Exception:
+        health = {}
+    proxies_data = health.get("proxies", {}) if isinstance(health, dict) else {}
+    last_check = health.get("last_check_at", 0) if isinstance(health, dict) else 0
+    now = _time.time()
+
+    # 缓存可用代理
+    good = [p for p in pool if proxies_data.get(p, {}).get("ok")]
+    cache_fresh = (now - last_check) < 900  # 15分钟
+    need_rescan = not cache_fresh or len(good) == 0
+
+    if need_rescan:
+        from .proxy_health import _test_all_proxies
+        try:
+            results = _test_all_proxies(pool, timeout=8)
+            good = [p for p, info in results.items() if info.get("ok")]
+            # 写回缓存
+            cur = dict(health) if isinstance(health, dict) else {}
+            cur.setdefault("proxies", {}).update(results)
+            cur["last_check_at"] = now
+            cur["healthy"] = len(good)
+            cur["unhealthy"] = len(pool) - len(good)
+            _db.set_setting("proxy_health", _json.dumps(cur))
+        except Exception:
+            pass  # 扫描失败，用缓存
+
+    return good
+
+
+def _check_plus_batch(at_list: list[tuple[str, str]]) -> dict[str, dict]:
+    """并发检查一批 access_token，用代理池轮换出口 IP。"""
+    from curl_cffi import requests as cffi_requests
+    url = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36"
+        ),
+    }
+    # 从缓存获取可用代理（15分钟自动刷新一次）
+    available = _get_check_proxies()
+    # 没有可用代理时 fallback 到 7890
+    if not available:
+        available = ["http://127.0.0.1:7890"]
+    results = {}
+    proxy_idx = 0
+
+    def _check_one(email: str, token: str) -> tuple[str, dict]:
+        nonlocal proxy_idx
+        proxy_idx = (proxy_idx + 1) % len(available)
+        raw = available[proxy_idx]
+        norm = raw
+        if norm.startswith("socks5://"):
+            norm = "socks5h://" + norm[len("socks5://"):]
+        my_proxy = {"https": norm, "http": norm}
+        try:
+            resp = cffi_requests.get(
+                url,
+                headers={**headers, "Authorization": f"Bearer {token}"},
+                proxies=my_proxy,
+                impersonate="chrome110",
+                timeout=20,
+            )
+            if resp.status_code == 401:
+                return email, {"status": "banned", "label": "封号（401）"}
+            if resp.status_code != 200:
+                return email, {"status": "check_error", "label": f"HTTP {resp.status_code}"}
+            data = _safe_response_json(resp)
+            if not isinstance(data, dict):
+                return email, {"status": "check_error", "label": "响应 JSON 格式错误"}
+            return email, _parse_account_check(data)
+        except Exception as e:
+            return email, {"status": "check_error", "label": str(e)[:120]}
+
+    with concurrent.futures.ThreadPoolExecutor(_CHECK_PLUS_CONCURRENCY) as pool:
+        fut_map = {pool.submit(_check_one, email, token): email for email, token in at_list}
+        for f in concurrent.futures.as_completed(fut_map):
+            email, info = f.result()
+            results[email] = info
+    return results
+
+
+def _safe_response_json(resp):
+    """安全读取响应 JSON；供应商返回 HTML/截断 JSON 时返回 None。"""
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _response_explicitly_deactivated(data, text: str = "") -> bool:
+    """仅在响应明确出现 deactivated 标志时判定封号。"""
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in {"is_deactivated", "deactivated"} and item is True:
+                    return True
+                if walk(item):
+                    return True
+        elif isinstance(value, list):
+            return any(walk(item) for item in value)
+        return False
+    if walk(data):
+        return True
+    lowered = str(text or "").lower()
+    return "is_deactivated" in lowered and "true" in lowered
+
+
+def _periodic_check_loop():
+    """后台线程：按配置定时检查所有有 access_token 的账号，清理 401/封号凭证。
+
+    开关和间隔都从 DB settings 读取（periodic_check_enabled / \
+    periodic_check_interval），可随时通过 API 调整，无需重启。
+    """
+    log = logging.getLogger("webui")
+    while True:
+        interval = _periodic_check_interval()
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            break
+
+        if not _periodic_check_enabled():
+            continue
+
+        try:
+            rows = db.list_credentialed()
+            if not rows:
+                continue
+            at_list = [(r["email"], r["access_token"]) for r in rows]
+            log.info(f"[periodic_check] 开始检测 {len(at_list)} 个账号...")
+            results = _check_plus_batch(at_list)
+            banned = 0
+            for email, info in results.items():
+                if info["status"] != "no_at":
+                    # 写入检查结果，覆盖旧数据（不删除、不清凭证）
+                    db.update_plus_check(email, {**info, "checked_at": time.time()})
+                    if info["status"] == "banned":
+                        banned += 1
+            log.info(
+                f"[periodic_check] 完成: 检测 {len(at_list)}, "
+                f"封号 {banned}, 间隔 {interval}s"
+            )
+        except Exception as e:
+            log.warning(f"[periodic_check] 循环异常: {type(e).__name__}: {e}")
+
+
+# 启动定时检测线程（开关和间隔由 DB 控制，线程常驻）
+_check_thread = threading.Thread(target=_periodic_check_loop, daemon=True, name="periodic-check")
+_check_thread.start()
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -271,6 +497,12 @@ def api_proxy_pool_sync(req: ProxyPoolSyncReq):
     return {"ok": True, "count": len(req.proxies)}
 
 
+@app.get("/api/proxy/pool")
+def api_proxy_pool_get():
+    """读取当前代理池。"""
+    return {"ok": True, "proxies": _get_proxy_pool_from_db()}
+
+
 @app.get("/api/proxy/health")
 def api_proxy_health():
     """返回各代理的健康状态（含绿色/红色指示，前端仪表盘用）。
@@ -334,7 +566,7 @@ def api_register(req: RegisterReq):
         if (account.get("kind") or "outlook") != mail_source:
             # 号池里混放多种邮箱，点名的号必须和当前来源一致，
             # 否则会拿 Outlook 的凭证去初始化 Gmail provider
-            db.release_unused(account["email"])
+            db.release_unused(account["email"], account.get("claim_token"))
             raise HTTPException(
                 400,
                 f"{req.email} 是 {account.get('kind')} 的号，"
@@ -411,9 +643,23 @@ def api_runs(limit: int = 50):
 
 
 @app.get("/api/registered")
-def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
-    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
-    total = db.count_registered(filter_rt=filter)
+def api_registered(limit: int = 20, offset: int = 0, filter: str = "all", search: str = ""):
+    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter, search=search)
+    total = db.count_registered(filter_rt=filter, search=search)
+    # 从 DB 读国家代码缓存（scripts/refresh_ip_country.py 维护），纯本地查，不卡
+    cc_map = {}
+    try:
+        raw = db.get_setting("ip_country_map", "")
+        if raw:
+            import json as _json
+            cc_map = _json.loads(raw) or {}
+    except Exception:
+        pass
+    if cc_map:
+        for i in items:
+            ip = i.get("exit_ip", "")
+            if ip and ip in cc_map and cc_map[ip]:
+                i["exit_ip"] = f"{cc_map[ip]}/{ip}"
     return {"ok": True, "items": items, "total": total}
 
 
@@ -428,12 +674,74 @@ def api_registered_without_refresh():
     return {"ok": True, "emails": emails, "count": len(emails)}
 
 
+# ──────────────────────── 定时检测配置 ────────────────────────
+
+
+class CheckPeriodicConfigReq(BaseModel):
+    enabled: Optional[bool] = None
+    interval_seconds: Optional[int] = None
+
+
+@app.get("/api/registered/periodic_check")
+def api_periodic_check_get():
+    """读取定时检测配置。"""
+    return {
+        "ok": True,
+        "enabled": _periodic_check_enabled(),
+        "interval_seconds": _periodic_check_interval(),
+    }
+
+
+@app.post("/api/registered/periodic_check")
+def api_periodic_check_set(req: CheckPeriodicConfigReq):
+    """更新定时检测配置（开关 / 间隔）。"""
+    if req.enabled is not None:
+        db.set_setting("periodic_check_enabled", "1" if req.enabled else "0")
+    if req.interval_seconds is not None:
+        interval = max(600, int(req.interval_seconds))
+        db.set_setting("periodic_check_interval", str(interval))
+    return {
+        "ok": True,
+        "enabled": _periodic_check_enabled(),
+        "interval_seconds": _periodic_check_interval(),
+    }
+
+
 @app.get("/api/registered/{email}")
 def api_registered_one(email: str):
     row = db.get_registered(email)
     if not row:
         raise HTTPException(404, "not found")
     return {"ok": True, "data": row}
+
+
+import base64, struct, hashlib, hmac, time as _time
+
+def _hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
+    msg = struct.pack(">Q", counter)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+@app.post("/api/registered/{email}/totp")
+def api_totp(email: str):
+    """计算当前 TOTP 动态码（用于 2FA 登录）"""
+    email = email.strip().lower()
+    cred = db.get_registered(email)
+    if not cred:
+        raise HTTPException(404, "账号不存在")
+    extra = cred.get("extra") or {}
+    totp_secret = extra.get("totp_secret", "")
+    if not totp_secret:
+        raise HTTPException(400, "该账号无 TOTP secret")
+    period = 30
+    now = int(_time.time())
+    counter = now // period
+    code = _hotp(totp_secret, counter)
+    expires_in = period - (now % period)
+    return {"ok": True, "code": code, "expires_in": expires_in}
 
 
 @app.delete("/api/registered/{email}")
@@ -444,20 +752,188 @@ def api_delete_registered(email: str):
     return {"ok": True}
 
 
+class ConfirmPaymentReq(BaseModel):
+    url: str = Field("", description="Adyen 回调地址或 chatgpt.com/checkout/verify 地址")
+
+
+@app.post("/api/registered/{email}/confirm_payment")
+def api_confirm_payment(email: str, req: ConfirmPaymentReq):
+    """确认第三方支付回调（Adyen GCash 等）。粘贴支付回调地址，用该账号凭证调
+    POST /backend-api/payments/checkout/custom_payment_method/continue 完成确认。"""
+    import urllib.parse as _up
+    from curl_cffi import requests as cffi_requests
+
+    email = email.strip().lower()
+    cred = db.get_registered(email)
+    if not cred:
+        raise HTTPException(404, "账号不存在")
+    at = (cred.get("access_token") or "").strip()
+    ck = (cred.get("cookie_header") or "").strip()
+    if not at:
+        raise HTTPException(400, "该账号无 access_token，无法确认支付")
+    exit_ip = ""
+    if isinstance(cred.get("extra"), dict):
+        exit_ip = cred.get("extra", {}).get("exit_ip", "")
+
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "请输入支付回调地址")
+
+    # ── 1. 从回调地址提取 stripe_session_id + redirectResult ──
+    sid = ""
+    redirect_result = ""
+    parsed = _up.urlparse(url)
+
+    # 情况 A: Adyen checkoutPaymentReturn → 302 到 chatgpt.com/checkout/verify
+    if "checkoutshopper" in url or "checkoutPaymentReturn" in url:
+        try:
+            # 需要代理访问 adyen（国内直连不稳），先试 7890，失败轮换
+            proxy_ok = ""
+            proxies_cfg = {}
+            try:
+                p_raw = db.get_setting("proxy_pool", "[]")
+                pool = json.loads(p_raw) if p_raw else []
+            except Exception:
+                pool = []
+            if not pool:
+                pool = ["socks5://127.0.0.1:1080", "http://127.0.0.1:7890"]
+            for p in pool:
+                norm = p
+                if norm.startswith("socks5://"):
+                    norm = "socks5h://" + norm[len("socks5://"):]
+                try:
+                    r = cffi_requests.get(url, impersonate="chrome110",
+                                          proxies={"https": norm, "http": norm},
+                                          timeout=15, allow_redirects=False)
+                    if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+                        loc = r.headers["location"]
+                        qs = _up.urlparse(loc).query
+                        qp = dict(_up.parse_qsl(qs))
+                        sid = qp.get("stripe_session_id", "")
+                        redirect_result = qp.get("redirectResult", "")
+                        proxy_ok = norm
+                        break
+                except Exception:
+                    continue
+            if not sid or not redirect_result:
+                raise HTTPException(400, "Adyen 回调地址跳转后未提取到支付参数，可能已失效")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"访问 Adyen 回调失败: {str(e)[:150]}")
+
+    # 情况 B: 直接是 chatgpt.com/checkout/verify 完整地址
+    elif "checkout/verify" in url or "checkoutPaymentReturn" in url:
+        qs = parsed.query
+        qp = dict(_up.parse_qsl(qs))
+        sid = qp.get("stripe_session_id", "")
+        redirect_result = qp.get("redirectResult", "")
+
+    # 情况 C: 用户只粘贴了后端确认 API 的 body（checkout_session_id + redirectResult 手填）
+    else:
+        qs = parsed.query
+        qp = dict(_up.parse_qsl(qs))
+        sid = qp.get("checkout_session_id", "") or qp.get("stripe_session_id", "")
+        redirect_result = qp.get("redirectResult", "")
+
+    if not sid:
+        raise HTTPException(400, "未提取到 checkout_session_id（stripe_session_id），请粘贴完整回调地址")
+    if not redirect_result:
+        raise HTTPException(400, "未提取到 redirectResult，请粘贴完整回调地址")
+
+    # ── 2. 找该账号出口 IP 对应的代理 ──
+    body = {"checkout_session_id": sid, "action_result": {"redirectResult": redirect_result}}
+    confirm_url = "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/continue"
+    common_headers = {
+        "Authorization": f"Bearer {at}",
+        "Cookie": ck,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/checkout/verify",
+    }
+
+    # 构造候选代理：匹配 exit_ip 的优先，否则代理池轮换
+    candidates = []
+    try:
+        p_raw = db.get_setting("proxy_pool", "[]")
+        pool = json.loads(p_raw) if p_raw else []
+    except Exception:
+        pool = []
+    if not pool:
+        pool = ["socks5://127.0.0.1:1080", "http://127.0.0.1:7890"]
+
+    if exit_ip:
+        for p in pool:
+            pn = p
+            if pn.startswith("socks5://"):
+                pn = "socks5h://" + pn[len("socks5://"):]
+            candidates.append((p, pn))
+        # 动态匹配出口 IP（轻量，最多测 5 个）
+        import re as _re
+        for p, pn in candidates[:5]:
+            try:
+                ip_r = cffi_requests.get("https://api.ipify.org", proxies={"https": pn, "http": pn},
+                                          impersonate="chrome110", timeout=6)
+                if ip_r.status_code == 200 and ip_r.text.strip() == exit_ip:
+                    candidates.insert(0, candidates.pop(candidates.index((p, pn))))
+                    break
+            except Exception:
+                continue
+    else:
+        for p in pool:
+            pn = p
+            if pn.startswith("socks5://"):
+                pn = "socks5h://" + pn[len("socks5://"):]
+            candidates.append((p, pn))
+
+    errors = []
+    for p_raw, p_norm in candidates:
+        try:
+            r = cffi_requests.post(confirm_url, json=body, headers=common_headers,
+                                   proxies={"https": p_norm, "http": p_norm},
+                                   impersonate="chrome110", timeout=25)
+            if r.status_code == 200:
+                try:
+                    detail = r.json()
+                except Exception:
+                    detail = {}
+                return {
+                    "ok": True,
+                    "message": "✅ 支付确认成功",
+                    "detail": detail,
+                    "proxy": p_raw,
+                }
+            errors.append(f"{p_raw}: HTTP {r.status_code} {r.text[:150]}")
+        except Exception as e:
+            errors.append(f"{p_raw}: {str(e)[:120]}")
+
+    return {
+        "ok": False,
+        "message": "❌ 支付确认失败",
+        "errors": errors[:6],
+    }
+
+
 class BulkDeleteRegisteredReq(BaseModel):
-    emails: Optional[list[str]] = Field(None, description="按 email 列表删；留空 + all=true 则删全部")
+    emails: Optional[list[str]] = Field(None, description="按 email 列表删")
     all: bool = False
+    status: Optional[str] = Field(None, description="按 plus_check.status 删，如 banned")
 
 
 @app.post("/api/registered/bulk_delete")
 def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
+    if req.status:
+        n = db.delete_registered_by_status(req.status.strip().lower())
+        return {"ok": True, "deleted": n, "by": "status"}
     if req.all:
         n = db.delete_all_registered()
         return {"ok": True, "deleted": n, "by": "all"}
     if req.emails:
         n = db.delete_registered_by_emails(req.emails)
         return {"ok": True, "deleted": n, "by": "emails"}
-    raise HTTPException(400, "需要 emails 或 all=true")
+    raise HTTPException(400, "需要 emails、all=true 或 status")
 
 
 # ──────────────────────── 批量导出（文本） ────────────────────────
@@ -555,6 +1031,297 @@ def api_save_mail_config(req: SaveMailConfigReq):
     except MailProviderError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "config": db.get_mail_config()}
+
+
+@app.post("/api/tempo/verify-token")
+def api_tempo_verify_token(req: dict):
+    """验证 Tempo Mails app_token 是否有效。"""
+    import requests as _req
+    import json as _json
+    token = (req.get("token") or "").strip()
+    if not token:
+        return {"ok": False, "error": "token 为空"}
+    try:
+        rr = _req.post(
+            f"https://tempomails.com/api/emails/{token}",
+            json={},
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+                     "Content-Type": "application/json", "Accept": "application/json"},
+            timeout=15,
+        )
+        if rr.status_code == 200:
+            data = rr.json()
+            email = (data.get("data") or {}).get("email", "")
+            if email:
+                return {"ok": True, "email": email, "message": f"token 有效，可创建邮箱 {email}"}
+        return {"ok": False, "error": f"token 无效 (HTTP {rr.status_code})"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+
+@app.get("/api/tempo/store")
+def api_tempo_store_list(search: str = "", limit: int = 20, offset: int = 0):
+    """列出已保存的 Tempo 邮箱库（分页 + 过期标记）。"""
+    import os
+    from pathlib import Path
+    from .mail_store import MailStore
+    _path = os.path.join(Path(__file__).resolve().parent, "tempo_mail_store.db")
+    if not os.path.exists(_path):
+        return {"ok": True, "items": [], "total": 0}
+    try:
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
+        store = MailStore(_path)
+        total = store.count(search=search)
+        items = store.list_paginated(limit=limit, offset=offset, search=search)
+        # 过期标记：expire_at 是 "YYYY-MM-DD HH:MM:SS"（或 ISO），与当前时间比
+        from datetime import datetime
+        now = datetime.now()
+        for it in items:
+            ex = (it.get("expire_at") or "").strip()
+            expired = False
+            if ex:
+                try:
+                    fmt = "%Y-%m-%d %H:%M:%S"
+                    if "T" in ex:
+                        fmt = "%Y-%m-%dT%H:%M:%S"
+                    t = datetime.strptime(ex[:19], fmt)
+                    expired = t < now
+                except Exception:
+                    try:
+                        # ISO 带时区
+                        from datetime import datetime as _dt, timezone
+                        t = _dt.fromisoformat(ex.replace("Z", "+00:00"))
+                        expired = t < now.astimezone()
+                    except Exception:
+                        expired = None  # 无法解析
+                        if not ex:
+                            expired = False
+            it["expired"] = expired
+        return {"ok": True, "items": items, "total": total}
+    except Exception as e:
+        raise HTTPException(500, f"读取失败: {str(e)[:200]}")
+
+
+@app.post("/api/tempo/store/delete")
+def api_tempo_store_delete(req: dict):
+    """按 email 列表批量删除 Tempo 邮箱。"""
+    import os
+    from pathlib import Path
+    from .mail_store import MailStore
+    emails = [e.strip() for e in (req.get("emails") or []) if e and e.strip()]
+    if not emails:
+        raise HTTPException(400, "emails 不能为空")
+    _path = os.path.join(Path(__file__).resolve().parent, "tempo_mail_store.db")
+    store = MailStore(_path)
+    deleted = 0
+    for email in emails:
+        try:
+            if store.remove(email):
+                deleted += 1
+        except Exception:
+            pass
+    return {"ok": True, "deleted": deleted, "requested": len(emails)}
+
+
+@app.post("/api/tempo/store/refresh")
+def api_tempo_store_refresh(req: dict):
+    """刷新指定邮箱的最新邮件（支持 Tempo + Temp-Mail 后端），返回 OTP 和正文片段。"""
+    email = (req.get("email") or "").strip()
+    if not email:
+        return {"ok": False, "error": "email 必填"}
+    import os as _os
+    from pathlib import Path as _Path
+    from .mail_store import MailStore as _MailStore
+    _path = _os.path.join(_Path(__file__).resolve().parent, "tempo_mail_store.db")
+    _rec = None
+    if _os.path.exists(_path):
+        try:
+            _rec = _MailStore(_path).get(email)
+        except Exception:
+            pass
+    _source = (_rec.get("source") if _rec else "").strip()
+    _email_token = (_rec.get("email_token") if _rec else "").strip()
+    import requests as _req
+    # ── Tempo 后端 ──
+    if _source == "tempo":
+        # app_token 是全局设置，总是用 settings 里的，避免库里旧记录用过期 token
+        from .db import get_setting as _get_setting
+        app_token = _get_setting("tempo_app_token", "").strip()
+        if not app_token:
+            return {"ok": False, "error": "app_token 未配置，请在邮箱配置中设置 Tempo App Token"}
+        r = _req.get(
+            f"https://tempomails.com/api/messages/{app_token}/{email}",
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+                     "Accept": "application/json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": f"Tempo HTTP {r.status_code}"}
+        data = r.json()
+        msgs = data.get("messages") or []
+    # ── Temp-Mail 免费版后端 ──
+    elif _source == "tempmail":
+        if not _email_token:
+            return {"ok": False, "error": "邮箱无 token（email_token 为空），无法收件"}
+        try:
+            from curl_cffi import requests as _cffi
+            _s = _cffi.Session(impersonate="chrome124")
+            _s.get("https://temp-mail.org/zh/", impersonate="chrome124", timeout=15)
+            r = _s.get("https://web2.temp-mail.org/messages",
+                       headers={"Authorization": f"Bearer {_email_token}"},
+                       timeout=15)
+        except ImportError:
+            r = _req.get("https://web2.temp-mail.org/messages",
+                         headers={"Authorization": f"Bearer {_email_token}",
+                                  "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"},
+                         timeout=15)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"Temp-Mail HTTP {r.status_code}"}
+        data = r.json()
+        msgs = data.get("messages") or []
+        # 列表接口只有 bodyPreview；逐封读取 /messages/{_id} 获取 bodyHtml。
+        for _m in msgs:
+            _mid = _m.get("_id")
+            if not _mid:
+                continue
+            try:
+                _detail = _s.get(
+                    f"https://web2.temp-mail.org/messages/{_mid}",
+                    headers={"Authorization": f"Bearer {_email_token}"},
+                    timeout=15,
+                )
+                if _detail.status_code == 200:
+                    _m.update(_detail.json())
+            except Exception:
+                pass
+    elif _source == "tempamail":
+        from .db import get_setting as _get_setting
+        _uuid = _get_setting("tempamail_uuid", "").strip()
+        if not _uuid:
+            _uuid = "c3c40144-a00c-43f5-9bb0-fb2f92bac1c4"
+        if not _email_token:
+            return {"ok": False, "error": "邮箱无 email_id（email_token 为空），无法收件"}
+        import json as _json, urllib.request as _ur, urllib.error as _ue
+        _payload = _json.dumps({"uuid": _uuid, "email_id": int(_email_token)}).encode()
+        _r = _ur.Request("https://api.tempamail.com/android/messages",
+                         data=_payload,
+                         headers={"Content-Type": "application/json", "Accept": "application/json"},
+                         method="POST")
+        try:
+            with _ur.urlopen(_r, timeout=15) as _resp:
+                _data = _json.loads(_resp.read().decode())
+        except _ue.HTTPError as _e:
+            _err_body = _e.read().decode()
+            return {"ok": False, "error": f"TempMail2 HTTP {_e.code}: {_err_body[:200]}"}
+        except Exception as _e:
+            return {"ok": False, "error": f"TempMail2 请求异常: {str(_e)[:200]}"}
+        msgs = _data.get("messages") or []
+    # ── fmail 集群后端 ──
+    elif _source == "fmail":
+        try:
+            from curl_cffi import requests as _cffi
+            _s = _cffi.Session(impersonate="chrome124")
+            _ua = email.split("@", 1)
+            if len(_ua) != 2:
+                return {"ok": False, "error": "fmail 邮箱格式不正确"}
+            _u, _h = _ua[0], _ua[1]
+            _r = _s.get(f"https://{_h}/api/inbox/{_u}?domain={_h}", timeout=15)
+            if _r.status_code != 200:
+                return {"ok": False, "error": f"fmail HTTP {_r.status_code}"}
+            _data = _r.json()
+            _list = []
+            for _m in (_data.get("emails") or []):
+                _tk = (_m.get("token") or "").strip()
+                if not _tk:
+                    continue
+                _body = {}
+                try:
+                    _r2 = _s.get(f"https://{_h}/api/email/{_tk}", timeout=15)
+                    if _r2.status_code == 200:
+                        _body = _r2.json()
+                except Exception:
+                    pass
+                _list.append({
+                    "id": _m.get("id"),
+                    "from": _m.get("sender") or _m.get("from") or "",
+                    "subject": _m.get("subject") or "",
+                    "received_at": _m.get("received_at"),
+                    "body_html": _body.get("body_html") or "",
+                    "body_text": _body.get("body_text") or "",
+                })
+            msgs = _list
+        except Exception as _e:
+            return {"ok": False, "error": f"fmail 请求异常: {str(_e)[:200]}"}
+    else:
+        return {"ok": False, "error": f"不支持的邮箱来源: {_source or '未知'}"}
+
+    out = []
+    import re as _re
+    import re
+    from html.parser import HTMLParser as _HTMLParser
+
+    class _HtmlText(_HTMLParser):
+        """把 HTML 转成易读纯文本。"""
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+            self.skip = 0  # style/script 深度
+        def handle_starttag(self, tag, attrs):
+            if tag in ("style", "script"):
+                self.skip += 1
+            if tag in ("br", "p", "div", "tr", "li", "h1", "h2", "h3"):
+                self.parts.append("\n")
+            elif tag in ("td", "th"):
+                self.parts.append(" | ")
+        def handle_endtag(self, tag):
+            if tag in ("style", "script") and self.skip > 0:
+                self.skip -= 1
+            if tag in ("p", "div", "tr", "li", "h1", "h2", "h3"):
+                self.parts.append("\n")
+        def handle_data(self, data):
+            if self.skip == 0:
+                self.parts.append(data)
+        def text(self):
+            raw = "".join(self.parts)
+            # 压缩连续空白，保留换行
+            lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.splitlines()]
+            out = "\n".join(ln for ln in lines if ln)
+            return out[:4000]
+
+    for m in msgs:
+        body = (m.get("body") or m.get("bodyHtml") or m.get("body_html")
+                or m.get("bodyText") or m.get("body_text") or
+                m.get("text") or m.get("content") or m.get("html") or
+                m.get("bodyPreview") or "")
+        subject = m.get("subject") or ""
+        from_addr = m.get("from_email") or m.get("from") or ""
+        otp = None
+        # ⚠️ 剔除 CSS 颜色码（#202123 之类），避免被误识别为 OTP
+        _body_clean = _re.sub(r"#\d{6}", "", body)
+        mm = _re.search(r'\b(\d{6})\b', _body_clean)
+        if mm:
+            otp = mm.group(1)
+        # 转成纯文本
+        if "<" in body and ">" in body:
+            _h = _HtmlText()
+            try:
+                _h.feed(body)
+                plain = _h.text()
+            except Exception:
+                plain = body[:4000]
+        else:
+            plain = body[:4000]
+        out.append({
+            "id": m.get("id", ""),
+            "from": from_addr,
+            "subject": subject,
+            "otp": otp,
+            "preview": body[:200],
+            "body": plain,
+        })
+    return {"ok": True, "messages": out}
 
 
 @app.post("/api/settings/mail/test")
@@ -735,6 +1502,11 @@ class SaveExportConfigReq(BaseModel):
     sub2api_api_key: Optional[str] = None   # '***' 不修改
     sub2api_group_ids: Optional[str] = None  # 逗号分隔，例 "2" 或 "1,2,3"
     sub2api_timeout: Optional[str] = None
+    # 本机 ChatGPT2API
+    c2a_enabled: Optional[str] = None
+    c2a_url: Optional[str] = None
+    c2a_api_key: Optional[str] = None
+    c2a_timeout: Optional[str] = None
 
 
 @app.get("/api/settings/export")
@@ -749,12 +1521,12 @@ def api_save_export_config(req: SaveExportConfigReq):
 
 
 class TestExportReq(BaseModel):
-    target: str = Field(..., description="cpa 或 sub2api")
+    target: str = Field(..., description="cpa / sub2api / chatgpt2api")
 
 
 @app.post("/api/settings/export/test")
 def api_test_export(req: TestExportReq):
-    """测试 CPA / SUB2API 连通性。"""
+    """测试 CPA / SUB2API / 本机 ChatGPT2API 连通性。"""
     from . import exporter
     cfg = db.get_export_internal_config()
     target = (req.target or "").strip().lower()
@@ -763,6 +1535,8 @@ def api_test_export(req: TestExportReq):
             return exporter.test_cpa(cfg["cpa"])
         if target == "sub2api":
             return exporter.test_sub2api(cfg["sub2api"])
+        if target == "chatgpt2api":
+            return exporter.test_chatgpt2api(cfg["chatgpt2api"])
         raise HTTPException(400, f"未知 target: {target}")
     except HTTPException:
         raise
@@ -789,25 +1563,121 @@ def api_manual_export_to_panel(req: ManualExportReq):
         raise HTTPException(404, f"未找到已注册账号: {req.email}")
 
     cfg = db.get_export_internal_config()
-    out = {"email": req.email, "cpa": None, "sub2api": None}
+    out = {"email": req.email, "cpa": None, "sub2api": None, "chatgpt2api": None}
     targets = {t.strip().lower() for t in (req.targets or []) if t}
 
     if "cpa" in targets:
         cpa_cfg = dict(cfg["cpa"])
         cpa_cfg["enabled"] = True  # 手动触发：强制启用
         try:
-            out["cpa"] = exporter.export_to_cpa(cred, cpa_cfg)
+            out["cpa"] = exporter.run_exports(cred, cpa_cfg=cpa_cfg).get("cpa")
         except Exception as e:
             out["cpa"] = {"ok": False, "error": str(e)}
     if "sub2api" in targets:
         sub2api_cfg = dict(cfg["sub2api"])
         sub2api_cfg["enabled"] = True
         try:
-            out["sub2api"] = exporter.export_to_sub2api(cred, sub2api_cfg)
+            out["sub2api"] = exporter.run_exports(cred, sub2api_cfg=sub2api_cfg).get("sub2api")
         except Exception as e:
             out["sub2api"] = {"ok": False, "error": str(e)}
+    if "chatgpt2api" in targets:
+        c2a_cfg = dict(cfg["chatgpt2api"])
+        c2a_cfg["enabled"] = True
+        try:
+            out["chatgpt2api"] = exporter.run_exports(cred, chatgpt2api_cfg=c2a_cfg).get("chatgpt2api")
+        except Exception as e:
+            out["chatgpt2api"] = {"ok": False, "error": str(e)}
 
     return {"ok": True, **out}
+
+
+class PushSelectedReq(BaseModel):
+    emails: list[str] = Field(..., description="要推送的邮箱列表")
+    proxy: str = Field("", description="无 RT 走 auth/session 时用的代理，留空直连")
+    targets: list[str] = Field(default_factory=lambda: ["cpa", "sub2api", "chatgpt2api"],
+                                description="手动推送目标面板：cpa / sub2api / chatgpt2api")
+
+
+@app.post("/api/registered/push_selected")
+def api_push_selected(req: PushSelectedReq):
+    """勾选批量推送到指定目标面板（cpa / sub2api / chatgpt2api）。
+
+    - 手动推送不受「导出配置」启用开关限制：只要 URL/密钥已配置就推。
+    - CPA 严禁无 RT 账号（无 RT 跳过）；SUB2API / ChatGPT2API 无 RT 也推。
+    """
+    from . import exporter as _exp
+
+    cleaned = list(dict.fromkeys(e.strip().lower() for e in (req.emails or []) if e and e.strip()))
+    if not cleaned:
+        raise HTTPException(400, "emails 不能为空")
+
+    targets = [t.strip().lower() for t in (req.targets or []) if t and t.strip()]
+    valid = {"cpa", "sub2api", "chatgpt2api"}
+    targets = [t for t in targets if t in valid]
+    if not targets:
+        raise HTTPException(400, "targets 不能为空")
+
+    cfg = db.get_export_internal_config()
+    # 手动推送：忽略启用开关，只要求目标的基础配置（URL/密钥）齐全；缺则让 export_to_xxx 报错。
+    cpa_cfg = dict(cfg["cpa"]); cpa_cfg["enabled"] = "cpa" in targets
+    sub2_cfg = dict(cfg["sub2api"]); sub2_cfg["enabled"] = "sub2api" in targets
+    c2a_cfg = dict(cfg["chatgpt2api"]); c2a_cfg["enabled"] = "chatgpt2api" in targets
+
+    results = {}
+    stat = {target: {"accepted": 0, "failed": 0, "skipped_no_rt": 0}
+            for target in ("cpa", "sub2api", "chatgpt2api")}
+
+    for email in cleaned:
+        cred = db.get_registered(email)
+        if not cred:
+            results[email] = {"status": "all_failed", "targets": {},
+                              "error": "registered 中无此号"}
+            continue
+        row = {}
+        try:
+            out = _exp.run_exports(
+                cred,
+                cpa_cfg=cpa_cfg if "cpa" in targets else None,
+                sub2api_cfg=sub2_cfg if "sub2api" in targets else None,
+                chatgpt2api_cfg=c2a_cfg if "chatgpt2api" in targets else None,
+                proxy=req.proxy.strip(),
+            )
+            for target in ("cpa", "sub2api", "chatgpt2api"):
+                res = out.get(target)
+                if res is None:
+                    continue
+                ok = bool(res.get("ok"))
+                skipped = bool(res.get("skipped_no_rt"))
+                if skipped:
+                    stat[target]["skipped_no_rt"] += 1
+                    row[target] = {"ok": False, "status": "skipped",
+                                   "message": "", "error": res.get("error") or "",
+                                   "skipped_no_rt": True}
+                else:
+                    row[target] = {"ok": ok, "status": res.get("status") or ("accepted" if ok else "failed"),
+                                   "message": res.get("message") or "",
+                                   "error": res.get("error") or ("" if ok else f"{target} 推送失败"),
+                                   "skipped_no_rt": False}
+                    stat[target]["accepted" if ok else "failed"] += 1
+        except Exception as e:
+            row["error"] = {"ok": False, "status": "failed", "target": "-", "error": str(e)[:300]}
+        target_results = [v for key, v in row.items() if key in ("cpa", "sub2api", "chatgpt2api")]
+        success_count = sum(bool(v.get("ok")) for v in target_results)
+        row["status"] = (
+            "all_success" if target_results and success_count == len(target_results)
+            else "partial_success" if success_count
+            else "all_failed"
+        )
+        row["targets"] = {key: value for key, value in row.items()
+                           if key in ("cpa", "sub2api", "chatgpt2api")}
+        results[email] = row
+
+    account_stats = {status: sum(r.get("status") == status for r in results.values())
+                     for status in ("all_success", "partial_success", "all_failed")}
+    return {"ok": True, **account_stats, "account_stats": account_stats,
+            "ok_count": account_stats["all_success"],
+            "failed_count": account_stats["all_failed"],
+            "by_target": stat, "results": results}
 
 
 # ──────────────────────── Plus 试用检查 ────────────────────────
@@ -818,15 +1688,158 @@ class CheckPlusReq(BaseModel):
     proxy: str = Field("", description="查询代理，留空直连")
 
 
+class CheckFilteredReq(BaseModel):
+    filter: str = Field("all", description="注册结果当前筛选")
+    search: str = Field("", description="注册结果当前搜索词")
+
+
+def _plan_label(plan: str) -> str:
+    value = (plan or "free").strip()
+    known = {"free": "Free", "plus": "Plus", "pro": "Pro", "team": "Team",
+             "business": "Business", "enterprise": "Enterprise", "go": "Go"}
+    return known.get(value.lower(), value.replace("_", " ").title())
+
+
+def _duration_label(duration: dict) -> str:
+    count = duration.get("num_periods")
+    period = str(duration.get("period") or "").lower()
+    if not count or not period:
+        return ""
+    units = {"day": "天", "week": "周", "month": "个月", "year": "年"}
+    unit = units.get(period.rstrip("s"), period)
+    return f"{count}{unit}"
+
+
+def _trial_remaining_label(expires_at) -> str:
+    if not expires_at:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        end = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        days = max(0, (end - datetime.now(timezone.utc)).days)
+        return f" · 剩余{days}天"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_account_check(data: dict) -> dict:
+    """把 accounts/check 的真实字段压成前端需要的稳定结构。"""
+    accounts = data.get("accounts") or {}
+    ordering = data.get("account_ordering") or []
+    ordered_keys = [key for key in ordering if key in accounts]
+    ordered_keys.extend(key for key in accounts if key != "default" and key not in ordered_keys)
+
+    workspaces = []
+    offers = []
+    deactivated = True
+    for key in ordered_keys:
+        info = accounts.get(key) or {}
+        acct = info.get("account") or {}
+        ent = info.get("entitlement") or {}
+        plan = str(acct.get("plan_type") or "free").lower()
+        is_deactivated = bool(acct.get("is_deactivated"))
+        deactivated = deactivated and is_deactivated
+        workspaces.append({
+            "plan_type": plan,
+            "plan_label": _plan_label(plan),
+            "structure": acct.get("structure"),
+            "workspace_type": acct.get("workspace_type"),
+            "active": plan != "free" or bool(ent.get("has_active_subscription")),
+            "trial": ent.get("trial"),
+            "expires_at": ent.get("expires_at"),
+            "renews_at": ent.get("renews_at"),
+        })
+        for promo_plan, promo in (info.get("eligible_promo_campaigns") or {}).items():
+            metadata = (promo or {}).get("metadata") or {}
+            duration = metadata.get("duration") or {}
+            discount = metadata.get("discount") or {}
+            percentage = discount.get("percentage")
+            offers.append({
+                "plan_type": str(promo_plan).lower(),
+                "plan_label": _plan_label(str(promo_plan)),
+                "plan_name": metadata.get("plan_name"),
+                "title": metadata.get("title"),
+                "promotion_type_label": metadata.get("promotion_type_label"),
+                "discount_percentage": percentage,
+                "duration": duration,
+                "duration_label": _duration_label(duration),
+            })
+
+    if not workspaces:
+        return {"status": "banned", "label": "无有效账户", "workspaces": [], "offers": []}
+    if deactivated:
+        return {"status": "banned", "label": "封号", "workspaces": workspaces, "offers": offers}
+
+    active = next((item for item in workspaces if item["active"]), None)
+    if active:
+        suffix = "试用中" if active.get("trial") else "生效中"
+        suffix += _trial_remaining_label(active.get("expires_at")) if active.get("trial") else ""
+        return {
+            "status": f"{active['plan_type']}_active",
+            "label": f"{active['plan_label']}{suffix}",
+            "plan_type": active["plan_type"],
+            "workspaces": workspaces,
+            "offers": offers,
+        }
+
+    if offers:
+        offer = offers[0]
+        percentage = offer.get("discount_percentage")
+        if percentage == 100:
+            benefit = "可免费试用"
+            status_suffix = "eligible"
+        elif isinstance(percentage, (int, float)):
+            benefit = f"可享{100 - percentage:g}%价格"
+            status_suffix = "discount"
+        else:
+            benefit = "有优惠"
+            status_suffix = "promo"
+        duration = f" · {offer['duration_label']}" if offer.get("duration_label") else ""
+        return {
+            "status": f"{offer['plan_type']}_{status_suffix}",
+            "label": f"{offer['plan_label']}{benefit}{duration}",
+            "plan_type": offer["plan_type"],
+            "workspaces": workspaces,
+            "offers": offers,
+        }
+
+    plan = workspaces[0]
+    return {
+        "status": plan["plan_type"],
+        "label": plan["plan_label"],
+        "plan_type": plan["plan_type"],
+        "workspaces": workspaces,
+        "offers": [],
+    }
+
+
+@app.post("/api/registered/check_filtered")
+def api_check_filtered(req: CheckFilteredReq):
+    """按注册结果页面当前筛选条件，20 并发检测全部有 AT 的账号。"""
+    rows = db.list_credentialed_filtered(req.filter, req.search)
+    at_list = [(row["email"], row["access_token"]) for row in rows]
+    if not at_list:
+        return {"ok": True, "total": 0, "results": {}}
+
+    results = _check_plus_batch(at_list)
+    checked_at = time.time()
+    for email, info in results.items():
+        db.update_plus_check(email, {**info, "checked_at": checked_at})
+    return {"ok": True, "total": len(at_list), "results": results}
+
+
 @app.post("/api/registered/check_plus")
 def api_check_plus(req: CheckPlusReq):
-    """用 access_token 查询账号的 Plus 试用状态。"""
+    """用 access_token 查询账号套餐、工作区和促销状态。"""
     try:
         from curl_cffi import requests as cffi_requests
     except ImportError:
         raise HTTPException(500, "curl_cffi 未安装")
 
     results = {}
+    at_list = []
     for email in req.emails:
         cred = db.get_registered(email)
         if not cred:
@@ -836,68 +1849,14 @@ def api_check_plus(req: CheckPlusReq):
         if not at:
             results[email] = {"status": "no_at", "label": "无AT"}
             continue
-        try:
-            proxies = None
-            proxy = req.proxy.strip()
-            # 检测 chatgpt.com 必须用 HTTP 代理（SOCKS5 对 chatgpt.com 有 TLS 问题）。
-            # 表单 proxy 是注册/跑号共用的 SOCKS5，会连不上 —— 检测这里强制走 DB 配置的
-            # check_plus_proxy（默认 sing-box HTTP 7890），不信任前端传来的 SOCKS5。
-            from . import db as _db
-            proxy = req.proxy.strip()
-            if proxy and not proxy.startswith("socks"):
-                proxies = {"https": proxy, "http": proxy}
-            else:
-                _proxy = _db.get_setting("check_plus_proxy", "")
-                if _proxy and not _proxy.startswith("socks"):
-                    proxies = {"https": _proxy, "http": _proxy}
-                else:
-                    proxies = {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7890"}
-            resp = cffi_requests.get(
-                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
-                headers={
-                    "Authorization": f"Bearer {at}",
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/145.0.0.0 Safari/537.36"
-                    ),
-                },
-                proxies=proxies,
-                impersonate="chrome110",
-                timeout=15,
-            )
-            if resp.status_code == 401:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            if resp.status_code != 200:
-                # HTTP 非 200/401 不记录，让前端继续显示"未检测"
-                continue
-            data = resp.json()
-            accts = data.get("accounts", {})
-            if not accts:
-                # 无账户数据不记录，让前端继续显示"未检测"
-                continue
-            info = next(iter(accts.values()))
-            acct = info.get("account", {})
-            ent = info.get("entitlement", {})
-            promo = info.get("eligible_promo_campaigns", {})
-            is_deactivated = acct.get("is_deactivated", False)
-            if is_deactivated:
-                results[email] = {"status": "banned", "label": "封号"}
-                continue
-            plan = acct.get("plan_type", "free")
-            has_sub = ent.get("has_active_subscription", False)
-            has_plus_promo = "plus" in promo and promo["plus"].get("id") == "plus-1-month-free"
-            if plan == "plus" or has_sub:
-                results[email] = {"status": "plus_active", "label": "Plus生效中"}
-            elif has_plus_promo:
-                results[email] = {"status": "plus_eligible", "label": "可领Plus试用"}
-            else:
-                results[email] = {"status": "free", "label": "Free"}
-        except Exception as e:
-            # 所有异常（包括 curl 网络错误）都不记录，让前端继续显示"未检测"
-            pass
+        at_list.append((email, at))
+
+    if not at_list:
+        return results
+
+    # 用多线程批量检测，复用 _check_plus_batch 的代理逻辑
+    batch_results = _check_plus_batch(at_list)
+    results.update(batch_results)
 
     import time as _time
     checked_at = _time.time()
@@ -906,6 +1865,9 @@ def api_check_plus(req: CheckPlusReq):
             db.update_plus_check(email, {**info, "checked_at": checked_at})
 
     return {"ok": True, "results": results}
+
+
+
 
 
 # ──────────────────────── 补 refresh（无 refresh_token 的号重跑注册） ────────────────────────
@@ -920,61 +1882,313 @@ class RefreshRefreshReq(BaseModel):
     otp_timeout: int = Field(10, description="接码超时秒数")
 
 
+def _get_proxy_pool_from_db() -> list:
+    """从 DB settings 读取代理池（JSON 数组），失败返回空列表。"""
+    import json as _json
+    try:
+        raw = db.get_setting("proxy_pool", "")
+        if not raw:
+            return []
+        pool = _json.loads(raw)
+        return [p for p in pool if p and isinstance(p, str)] if isinstance(pool, list) else []
+    except Exception:
+        return []
+
+
 @app.post("/api/registered/refresh_refresh")
 def api_refresh_refresh(req: RefreshRefreshReq):
-    """对一批无 refresh_token 的号逐个重跑注册以补 refresh。
+    """对一批无 refresh_token 的号逐个“重登录 + 接码绑定手机号”补 refresh。
 
-    流程（每个号）：
-      a. 查 outlook_creds 表取原始凭证（password / client_id / refresh_token）
-      b. 以 outlook 格式导入号池 outlook_accounts（import_accounts）
-      c. 重置号为 available
-      d. 调用 registrar.start_registration 跑注册（后台线程）
-      e. 记录成功（已启动）或失败（无凭证 / 导入失败 / 启动异常）
+    2026-08-30 重写：不再依赖 outlook_creds（旧逻辑对该表无凭证的临时邮箱号
+    全部失败）。改为直接读 registered 里的 password + totp_secret，走
+    run_protocol_login 重登录；若 OpenAI 要求 add-phone，用 sms_callback 接码
+    绑手机号，OAuth 换 refresh_token 后回写。
 
     返回 {"started": [...], "failed": {email: 原因}}。实际是否拿到 refresh
-    由后台注册线程负责（成功会 save_registered 并 _try_export_to_panels）。
+    由后台线程负责（结果写入 registered.refresh_token）。
     """
     cleaned = [e.strip().lower() for e in (req.emails or []) if e and e.strip()]
     if not cleaned:
         raise HTTPException(400, "emails 不能为空")
 
+    _ensure_refresh_worker()
     results = {}
+    seen = set()
     for email in cleaned:
+        if email in seen:
+            continue
+        seen.add(email)
         try:
-            cred = db.get_outlook_cred(email)
-            if not cred:
-                results[email] = {"ok": False, "error": "outlook_creds 中无此凭证"}
+            reg = db.get_registered(email)
+            if not reg:
+                results[email] = {"ok": False, "error": "registered 中无此号"}
                 continue
-            # b. 导入号池（outlook 格式：email----password----client_id----refresh_token）
-            line = (
-                f"{cred['email']}----{cred['password'] or ''}----"
-                f"{cred['client_id'] or ''}----{cred['refresh_token'] or ''}"
-            )
-            db.import_accounts(line, kind="outlook")
-            # c. 重置为 available
-            db.reset_to_available(email)
-            # 从池里取回该号（含 kind 等字段）
-            account = db.get_account(email)
-            if not account:
-                results[email] = {"ok": False, "error": "导入号池后找不到该号"}
+            if (reg.get("refresh_token") or "").strip():
+                results[email] = {"ok": False, "error": "已有 refresh_token，拒绝重复补 refresh"}
                 continue
-            # d. 启动注册（后台线程），want_refresh_token 必须为 True
-            options = {
-                "want_access_token": True,
-                "want_session_token": True,
-                "want_refresh_token": True,
-                "proxy": req.proxy or "",
-                "otp_timeout": int(req.otp_timeout or 10),
-                "allow_existing_login": True,
-            }
-            run_id = registrar.start_registration(account, options)
-            results[email] = {"ok": True, "run_id": run_id}
+            password = (reg.get("password") or "").strip()
+            extra = reg.get("extra") or {}
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:
+                    extra = {}
+            totp = (extra.get("totp_secret") or "").strip()
+            if not password:
+                results[email] = {"ok": False, "error": "无密码，无法重登录(补 refresh 需密码+手机接码)"}
+                continue
+
+            proxy = (req.proxy or "").strip()
+            if not proxy:
+                proxy_pool = _get_proxy_pool_from_db()
+                proxy = proxy_pool[hash(email) % len(proxy_pool)] if proxy_pool else "socks5://127.0.0.1:1081"
+
+            import uuid as _uuid
+            from . import registrar as _reg
+            run_id = _uuid.uuid4().hex[:12]
+            log_file = _reg.LOG_DIR / f"{run_id}.log"
+            _reg.db.create_run(run_id, email, str(log_file), proxy)
+            with _refresh_worker_guard:
+                if email in _refresh_inflight:
+                    results[email] = {"ok": False, "error": "该邮箱已有补 refresh 任务运行中"}
+                    _reg.db.finish_run(run_id, "failed", "重复任务", "duplicate")
+                    continue
+                _refresh_inflight.add(email)
+            _refresh_queue.put((email, password, totp, proxy,
+                                max(1, min(int(req.otp_timeout or 10), 600)), run_id))
+            results[email] = {"ok": True, "status": "queued", "run_id": run_id,
+                              "msg": "已入队，等待单 worker 执行"}
         except Exception as e:  # noqa: BLE001
             results[email] = {"ok": False, "error": str(e)[:200]}
 
     started = [e for e, r in results.items() if r.get("ok")]
     failed = {e: r["error"] for e, r in results.items() if not r.get("ok")}
     return {"ok": True, "started": started, "failed": failed, "results": results}
+
+
+# 补 refresh 单 worker 队列：提交端只入队，避免一次请求创建 N 个登录线程。
+_refresh_queue: queue.Queue = queue.Queue()
+_refresh_worker_started = False
+_refresh_worker_guard = threading.Lock()
+_refresh_inflight: set[str] = set()
+
+
+def _ensure_refresh_worker() -> None:
+    global _refresh_worker_started
+    with _refresh_worker_guard:
+        if _refresh_worker_started:
+            return
+        _refresh_worker_started = True
+        threading.Thread(
+            target=_refresh_worker_loop,
+            daemon=True,
+            name="refresh-refresh-worker",
+        ).start()
+
+
+def _refresh_worker_loop() -> None:
+    while True:
+        item = _refresh_queue.get()
+        if item is None:
+            _refresh_queue.task_done()
+            return
+        email, password, totp, proxy, otp_timeout, run_id = item
+        try:
+            res = _refresh_rt_one(email, password, totp, proxy, run_id, otp_timeout=otp_timeout)
+            if res.get("ok"):
+                db.finish_run(run_id, "done")
+            else:
+                db.finish_run(run_id, "failed", res.get("error", ""), res.get("category", ""))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("webui").exception("[refresh_refresh] worker 异常 %s", email)
+            db.finish_run(run_id, "failed", str(exc), "exception")
+        finally:
+            with _refresh_worker_guard:
+                _refresh_inflight.discard(email)
+            _refresh_queue.task_done()
+
+
+def _refresh_rt_one(email: str, password: str, totp: str, proxy: str, run_id: str = "", *, otp_timeout: int = 10) -> dict:
+    """单个号：密码(+TOTP)重登录 → 接码 add-phone → OAuth 换 refresh_token 回写。"""
+    email = email.strip().lower()
+    try:
+        from config import Config as _Config
+        from auth_flow import AuthFlow as _AuthFlow
+        from . import registrar as _reg
+
+        def _log_emit(msg: str) -> None:
+            _reg._emit_status(run_id, "phase", {"phase": "refresh_rt", "message": msg})
+            logging.getLogger("webui").info("[refresh_rt] %s %s", email, msg)
+
+        _log_emit("开始重登录补 refresh（密码+TOTP）")
+        sms_cb = _reg._build_sms_callback(run_id, force_enabled=True)
+
+        def account_cb(_em):
+            return {"password": password, "totp_secret": totp}
+
+        flow = _AuthFlow(
+            config=_Config(proxy=proxy),
+            sms_callback=sms_cb,
+            account_callback=account_cb,
+            # 接码超时：DDG @duck.com 绑定 outlook 转发延迟 30-60s+，10s 默认必挂；
+            # 统一抬到至少 180s（2026-09-15 实测 timeout 10s 全失败、54s 才收到 OTP）。
+            env_overrides={"OTP_TIMEOUT": str(max(180, int(otp_timeout or 10)))},
+            allow_existing_login=True,
+        )
+        _log_emit("协议登录中...")
+        res = flow.run_protocol_login(mail_provider=None, email=email, password=password)
+        new_rt = res.refresh_token or ""
+        new_at = res.access_token or ""
+        if not new_rt:
+            return {"ok": False, "error": "登录完成但未拿到 refresh_token", "category": "no_rt"}
+        db.update_auth_tokens(
+            email,
+            access_token=new_at or (db.get_registered(email) or {}).get("access_token", ""),
+            session_token=res.session_token or "",
+            refresh_token=new_rt,
+            cookie_header=res.cookie_header or "",
+            device_id=res.device_id or "",
+        )
+        _log_emit(f"✅ 拿到 refresh_token (len={len(new_rt)})，已回写")
+        # 保留原有行为：补齐 RT 后按已启用目标尝试导出；导出失败不影响补证。
+        try:
+            _reg._try_export_to_panels(run_id, {
+                "email": email,
+                "access_token": new_at or (db.get_registered(email) or {}).get("access_token", ""),
+                "refresh_token": new_rt,
+                "session_token": res.session_token or "",
+                "cookie_header": res.cookie_header or "",
+                "device_id": res.device_id or "",
+            })
+            _log_emit("已尝试推送已启用目标（结果见 export 日志）")
+        except Exception as export_exc:  # noqa: BLE001
+            logging.getLogger("webui").warning("[refresh_rt] 导出失败(不影响补 refresh): %s", export_exc)
+        return {"ok": True, "new_rt_len": len(new_rt)}
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("webui").exception("[refresh_rt] %s 失败", email)
+        return {"ok": False, "error": str(e)[:300], "category": "exception"}
+
+
+# ──────────────────────── 刷新 AT（重登录换新凭证） ────────────────────────
+
+
+class RefreshAtReq(BaseModel):
+    emails: list[str] = Field(..., description="要刷新 access_token 的邮箱列表")
+    proxy: str = Field("", description="可选指定代理，留空从代理池轮换")
+
+
+def _refresh_at_one(email: str, proxy: str) -> dict:
+    """单个号：用 DB 存的 password + totp_secret 重走 OAuth 登录换新 AT，
+    回写 DB 凭证列，再用新 AT 查 accounts/check 纠正 plus_check 状态。
+
+    背景（2026-08-30 实测）：OpenAI 开通 Plus 后会轮换 access_token，
+    旧 AT 全 401 `Provided authentication token is expired`，面板 _check_plus_batch
+    把 401 一律标 banned —— 这是误判。refresh_at 通过重登录拿新凭证并纠正状态。
+    """
+    import os as _os
+    from config import Config as _Config
+    from auth_flow import AuthFlow as _AuthFlow
+
+    email = email.strip().lower()
+    try:
+        reg = db.get_registered(email)
+        if not reg:
+            return {"ok": False, "error": "DB 中无此号"}
+        password = (reg.get("password") or "").strip()
+        extra = reg.get("extra") or {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra)
+            except Exception:
+                extra = {}
+        totp = (extra.get("totp_secret") or "").strip()
+        if not password:
+            return {"ok": False, "error": "无密码，无法重登录"}
+
+        # 代理：优先指定，否则 DB 代理池按邮箱哈希轮换
+        if not proxy:
+            pool = _get_proxy_pool_from_db()
+            proxy = pool[hash(email) % len(pool)] if pool else "socks5://127.0.0.1:1081"
+
+        def account_cb(_em):
+            return {"password": password, "totp_secret": totp}
+
+        flow = _AuthFlow(
+            config=_Config(proxy=proxy),
+            account_callback=account_cb,
+            allow_existing_login=True,
+        )
+        res = flow.run_protocol_login(mail_provider=None, email=email, password=password)
+        new_at = res.access_token or ""
+        new_st = res.session_token or ""
+        new_ck = res.cookie_header or ""
+        new_did = res.device_id or ""
+        if not new_at:
+            return {"ok": False, "error": "登录未拿到 access_token"}
+
+        # 回写凭证（只动凭证列，保留 extra_json）
+        db.update_auth_tokens(
+            email,
+            access_token=new_at,
+            session_token=new_st,
+            cookie_header=new_ck,
+            device_id=new_did,
+        )
+
+        # 用新 AT 查真实状态，纠正 plus_check（banned → plus_active 等）
+        from curl_cffi import requests as cffi_requests
+        url = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+        hdrs = {
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            "Authorization": f"Bearer {new_at}",
+        }
+        if new_did:
+            hdrs["oai-device-id"] = new_did
+        if new_ck:
+            hdrs["Cookie"] = new_ck
+        norm = proxy
+        if norm.startswith("socks5://"):
+            norm = "socks5h://" + norm[len("socks5://"):]
+        chk = cffi_requests.get(url, headers=hdrs, proxies={"https": norm, "http": norm},
+                                impersonate="chrome136", timeout=25)
+        if chk.status_code == 200:
+            data = _safe_response_json(chk)
+            info = (_parse_account_check(data) if isinstance(data, dict)
+                    else {"status": "check_error", "label": "响应 JSON 格式错误"})
+            # 保证状态字段里带上 checked_at
+            info["checked_at"] = time.time()
+        else:
+            info = {"status": "check_error", "label": f"HTTP {chk.status_code}"}
+        info["at_refreshed_at"] = time.time()
+        db.update_plus_check(email, info)
+
+        return {
+            "ok": True,
+            "new_at_len": len(new_at),
+            "status": info.get("status"),
+            "label": info.get("label", ""),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/api/registered/refresh_at")
+def api_refresh_at(req: RefreshAtReq):
+    """对勾选的号逐个重登录刷新 access_token 并纠正 plus 状态。"""
+    cleaned = [e.strip().lower() for e in (req.emails or []) if e and e.strip()]
+    if not cleaned:
+        raise HTTPException(400, "emails 不能为空")
+    results = {}
+    for email in cleaned:
+        results[email] = _refresh_at_one(email, (req.proxy or "").strip())
+    ok_list = [e for e, r in results.items() if r.get("ok")]
+    failed = {e: r.get("error", "未知") for e, r in results.items() if not r.get("ok")}
+    return {"ok": True, "refreshed": ok_list, "failed": failed, "results": results}
 
 
 # ──────────────────────── Webhook 通知配置 ────────────────────────
@@ -1093,10 +2307,26 @@ async def api_auto_stream(request: Request):
 
 @app.get("/")
 def root():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+class _NoCacheStaticFiles(StaticFiles):
+    """Override StaticFiles to add Cache-Control headers."""
+
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
+
+
+app.mount(
+    "/static",
+    _NoCacheStaticFiles(directory=str(STATIC_DIR)),
+    name="static",
+)
 
 
 if __name__ == "__main__":

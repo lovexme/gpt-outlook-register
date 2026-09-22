@@ -24,7 +24,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const dataVersion = ref(0)      // 递增：通知号池/结果/记录表刷新
   const runningSingle = ref(false)
 
-  let currentEs = null
+  const runEs = new Map()
   let autoEs = null
 
   function addLog(text, kind) {
@@ -37,7 +37,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   // ─── 单个注册 run 的 SSE ───
   function streamRun(runId) {
-    if (currentEs) { try { currentEs.close() } catch (_) {} }
+    const old = runEs.get(runId)
+    if (old) { try { old.close() } catch (_) {} }
     runningSingle.value = true
     const es = createSSE(`/api/runs/${runId}/stream`, {
       log: (e) => {
@@ -71,17 +72,17 @@ export const useRuntimeStore = defineStore('runtime', () => {
       },
       end: () => {
         try { es.close() } catch (_) {}
-        currentEs = null
-        runningSingle.value = false
+        if (runEs.get(runId) === es) runEs.delete(runId)
+        runningSingle.value = runEs.size > 0
         useStatsStore().refresh()
         bumpData()
       },
     }, () => {
       try { es.close() } catch (_) {}
-      currentEs = null
-      runningSingle.value = false
+      if (runEs.get(runId) === es) runEs.delete(runId)
+      runningSingle.value = runEs.size > 0
     })
-    currentEs = es
+    runEs.set(runId, es)
   }
 
   // ─── 自动跑号全局 SSE（app 启动时连一次，自动重连） ───

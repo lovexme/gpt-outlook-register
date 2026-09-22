@@ -25,6 +25,7 @@ const fields = computed(() => current.value?.config_fields || [])
 // 池化 provider（Outlook 这类导号进来的）连通性绑在具体某个号上，
 // 没号可测；测试按钮只对非池化的显示。
 const canTest = computed(() => !!current.value && !current.value.pooled)
+const tokenLoading = ref(false)
 
 /** 密码类字段已存过 → 输入框留空表示"不修改"，提示语要说清楚 */
 function phFor(f) {
@@ -103,6 +104,31 @@ async function test() {
   }
 }
 
+async function fetchTempoToken() {
+  const token = (form.value.tempo_app_token || '').trim()
+  if (!token) {
+    ElMessage.warning('请先输入 App Token')
+    return
+  }
+  tokenLoading.value = true
+  try {
+    const r = await fetch('/api/tempo/verify-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }).then(r => r.json())
+    if (r.ok) {
+      ElMessage.success(`✅ token 有效，可创建邮箱（${r.email || ''}）`)
+    } else {
+      ElMessage.error(r.error || 'token 无效')
+    }
+  } catch (e) {
+    ElMessage.error('验证失败: ' + e.message)
+  } finally {
+    tokenLoading.value = false
+  }
+}
+
 onActivated(() => load())
 load()
 </script>
@@ -148,7 +174,11 @@ load()
             :type="f.type === 'password' ? 'password' : 'text'"
             :show-password="f.type === 'password'"
             :placeholder="phFor(f)"
-          />
+          >
+            <template v-if="f.key === 'tempo_app_token'" #append>
+              <el-button @click="fetchTempoToken" :loading="tokenLoading">验证</el-button>
+            </template>
+          </el-input>
           <div v-if="f.help" class="hint" style="margin-top: 4px">{{ f.help }}</div>
         </el-form-item>
 

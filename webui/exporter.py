@@ -23,6 +23,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -144,6 +145,13 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         raise RuntimeError("缺少 refresh_token，无法刷新 Codex access_token")
 
     cffi = _import_cffi()
+    proxy = (
+        os.environ.get("OPENAI_EXPORT_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or "http://127.0.0.1:7890"
+    ).strip()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     body = {
         "grant_type": "refresh_token",
         "client_id": CODEX_CLIENT_ID,
@@ -161,7 +169,7 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         OPENAI_TOKEN_ENDPOINT,
         headers=headers,
         data=body,
-        proxies=None,
+        proxies=proxies,
         verify=False,
         timeout=timeout,
         impersonate="chrome110",
@@ -188,7 +196,34 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
     return data
 
 
-# ──────────────────────── CPA：生成 token JSON ────────────────────────
+def _persist_rotated_refresh_token(cred: dict, fresh: dict) -> None:
+    """RT rotation 后只原子更新 DB refresh_token，保留其它字段/extra_json。"""
+    old_rt = str(cred.get("refresh_token") or "").strip()
+    new_rt = str(fresh.get("refresh_token") or "").strip()
+    email = str(cred.get("email") or "").strip().lower()
+    if new_rt and new_rt != old_rt and email:
+        from . import db
+        db.update_auth_tokens(email, refresh_token=new_rt)
+
+
+def _safe_response_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _business_response_error(data) -> str:
+    """识别 HTTP 2xx 但响应体明确表示业务失败。"""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("ok") is False or data.get("success") is False:
+        return str(data.get("message") or data.get("error") or data.get("detail") or "业务失败")
+    err = data.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("detail") or "业务失败")
+    return str(err) if err else ""
+
 
 
 def _build_compat_id_token(*, access_token: str, email: str) -> str:
@@ -382,8 +417,8 @@ def export_to_cpa(cred: dict, cfg: dict, *,
             )
             if resp.status_code in (200, 201):
                 log(f"[CPA] ✅ 上传成功 {filename}", "ok")
-                return {"ok": True, "email": email, "file_name": filename,
-                        "message": f"CPA 上传成功: {filename}"}
+                return {"ok": True, "status": "accepted", "email": email, "file_name": filename,
+                        "message": f"CPA accepted: {filename}"}
             msg = f"HTTP {resp.status_code}"
             try:
                 detail = resp.json()
@@ -541,8 +576,8 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                 except Exception:
                     pass
                 log(f"[SUB2API] ✅ 上传成功 {email} (id={new_id or 'unknown'})", "ok")
-                return {"ok": True, "email": email, "account_id": new_id,
-                        "message": f"SUB2API 上传成功 #{new_id or 'unknown'}"}
+                return {"ok": True, "status": "accepted", "email": email, "account_id": new_id,
+                        "message": f"SUB2API accepted #{new_id or 'unknown'}"}
             msg = f"HTTP {resp.status_code}"
             try:
                 detail = resp.json()
@@ -571,80 +606,143 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     return {"ok": False, "error": last_err or "重试耗尽", "email": email}
 
 
-# ──────────────────────── 连通性测试 ────────────────────────
+def _fetch_chatgpt_session_access_token(cred: dict, *, proxy: str = "") -> dict:
+    """没有 RT 时，用现有 session/cookie/AT 请求 chatgpt.com session 取 access_token。
 
-
-def test_cpa(cfg: dict) -> dict:
-    """CPA 连通性测试：GET /v0/management/auth-files 真校验 Bearer key。
-
-    用 GET 而不是 OPTIONS，因为 OPTIONS 是 CORS 预检，多数 CPA 实现不校验 Authorization，
-    会让 key 错误的配置误以为通了，到真上传时才返 401。
+    注册页面的 SOCKS5 可用于注册，却可能无法与 chatgpt.com 完成 TLS/SOCKS 握手。
+    这时只回退到后端专用 HTTP 检测代理，绝不影响有 RT 的导出路径。
     """
-    api_url = (cfg.get("cpa_url") or "").rstrip("/").strip()
-    api_key = (cfg.get("cpa_mgmt_key") or "").strip()
-    if not api_url:
-        raise RuntimeError("CPA 未配置 URL")
-    if not api_key:
-        raise RuntimeError("CPA 未配置管理密钥")
-    timeout = int(cfg.get("cpa_timeout") or DEFAULT_TIMEOUT)
     cffi = _import_cffi()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://chatgpt.com/",
+        "Origin": "https://chatgpt.com",
+    }
+    cookie_header = str(cred.get("cookie_header") or "").strip()
+    session_token = str(cred.get("session_token") or "").strip()
+    access_token = str(cred.get("access_token") or "").strip()
+    if session_token and "__Secure-next-auth.session-token=" not in cookie_header:
+        cookie_header = (cookie_header + "; " if cookie_header else "") + \
+            f"__Secure-next-auth.session-token={session_token}"
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
 
-    resp = cffi.get(
-        f"{api_url}/v0/management/auth-files",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "X-Management-Key": api_key,
-        },
-        proxies=None,
-        verify=False,
-        timeout=timeout,
-        impersonate="chrome110",
-    )
-    if resp.status_code in (200, 201, 204):
-        return {"ok": True, "message": f"CPA 连通正常 + 密钥有效 (HTTP {resp.status_code})"}
-    if resp.status_code in (401, 403):
-        body = ""
+    primary = str(proxy or "").strip()
+    candidates = [primary] if primary else []
+    if primary.lower().startswith(("socks4://", "socks5://", "socks5h://")):
         try:
-            body = (resp.text or "")[:200]
+            from . import db
+            fallback = str(db.get_setting("check_plus_proxy", "")).strip()
         except Exception:
-            pass
-        raise RuntimeError(
-            f"CPA 鉴权失败 (HTTP {resp.status_code})：管理密钥错误。响应：{body}"
-        )
-    # 405 Method Not Allowed 表示路径对但不允许 GET，至少 URL 通了
-    if resp.status_code == 405:
-        return {"ok": True, "message": f"CPA URL 可达（HTTP 405），但无法用 GET 验证密钥；请实际上传一次确认"}
-    raise RuntimeError(f"CPA 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+            fallback = ""
+        if fallback and fallback not in candidates:
+            candidates.append(fallback)
+    if not candidates:
+        candidates = [""]
+
+    errors = []
+    for selected_proxy in candidates:
+        try:
+            proxies = {"http": selected_proxy, "https": selected_proxy} if selected_proxy else None
+            resp = cffi.get(
+                "https://chatgpt.com/api/auth/session",
+                headers=headers,
+                proxies=proxies,
+                verify=False,
+                timeout=30,
+                impersonate="chrome110",
+            )
+            data = _safe_response_json(resp)
+            if resp.status_code != 200 or not isinstance(data, dict):
+                raise RuntimeError(f"chatgpt.com session 请求失败 HTTP {resp.status_code}")
+            new_at = str(data.get("accessToken") or data.get("access_token") or "").strip()
+            if not new_at:
+                raise RuntimeError("chatgpt.com session 未返回 access_token")
+            if selected_proxy != primary:
+                logger.info("[exporter] chatgpt.com session 已从 SOCKS5 回退到专用 HTTP 代理")
+            return {
+                "access_token": new_at,
+                "id_token": str(data.get("idToken") or data.get("id_token") or "").strip(),
+                "session_token": session_token,
+                "cookie_header": cookie_header,
+            }
+        except Exception as e:
+            errors.append(str(e))
+    raise RuntimeError("；".join(errors))
 
 
-def test_sub2api(cfg: dict) -> dict:
-    """SUB2API 连通性测试：GET 一个无害端点（用 admin/accounts list 验证 key）。"""
-    api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
-    api_key = (cfg.get("sub2api_api_key") or "").strip()
-    if not api_url:
-        raise RuntimeError("SUB2API 未配置 URL")
+def test_chatgpt2api(cfg: dict) -> dict:
+    """测试本机 ChatGPT2API 管理接口鉴权，不导入账号。"""
+    api_url = (cfg.get("c2a_url") or "http://127.0.0.1:8059").rstrip("/").strip()
+    api_key = (cfg.get("c2a_api_key") or "").strip()
     if not api_key:
-        raise RuntimeError("SUB2API 未配置 API Key")
-    timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
+        raise RuntimeError("ChatGPT2API 未配置 API Key")
+    timeout = int(cfg.get("c2a_timeout") or DEFAULT_TIMEOUT)
     cffi = _import_cffi()
-
     resp = cffi.get(
-        f"{api_url}/api/v1/admin/accounts",
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"{api_url}/admin/accounts",
-            "x-api-key": api_key,
-        },
-        proxies=None,
-        verify=False,
-        timeout=timeout,
-        impersonate="chrome110",
+        f"{api_url}/api/accounts",
+        headers={"Authorization": f"Bearer {api_key}"},
+        proxies=None, verify=False, timeout=timeout, impersonate="chrome110",
     )
-    if resp.status_code in (200, 201):
-        return {"ok": True, "message": f"SUB2API 连通正常 (HTTP {resp.status_code})"}
+    if resp.status_code == 200:
+        data = _safe_response_json(resp)
+        if isinstance(data, dict) and _business_response_error(data):
+            raise RuntimeError(f"ChatGPT2API 业务失败：{_business_response_error(data)}")
+        return {"ok": True, "message": "ChatGPT2API 连通正常"}
     if resp.status_code in (401, 403):
-        raise RuntimeError(f"SUB2API 鉴权失败 (HTTP {resp.status_code})，请检查 API Key")
-    raise RuntimeError(f"SUB2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+        raise RuntimeError(f"ChatGPT2API 鉴权失败 (HTTP {resp.status_code})，请检查 API Key")
+    raise RuntimeError(f"ChatGPT2API 返回 HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+
+
+def build_chatgpt2api_payload(cred: dict) -> dict:
+    """构建本机 ChatGPT2API /api/accounts 的账号导入 payload。"""
+    access_token = str(cred.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("未读取到可导入的 access_token")
+    return {"accounts": [{
+        "access_token": access_token,
+        "refresh_token": str(cred.get("refresh_token") or "").strip(),
+        "id_token": str(cred.get("id_token") or "").strip(),
+        "email": str(cred.get("email") or "").strip(),
+        "source_type": "codex",
+        "type": "codex",
+        "status": "正常",
+    }]}
+
+
+def export_to_chatgpt2api(cred: dict, cfg: dict, *,
+                          proxy: str = "",
+                          log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """导入一个账号到本机 ChatGPT2API。"""
+    api_url = (cfg.get("c2a_url") or "http://127.0.0.1:8059").rstrip("/").strip()
+    api_key = (cfg.get("c2a_api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("ChatGPT2API 未配置 API Key")
+    timeout = int(cfg.get("c2a_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+    payload = build_chatgpt2api_payload(cred)
+    email = payload["accounts"][0].get("email") or "unknown"
+    p = str(proxy or "").strip()
+    # 本机 ChatGPT2API 不能通过 SOCKS5 代理访问 127.0.0.1；远程地址才使用页面代理。
+    local_target = api_url.startswith(("http://127.0.0.1:", "http://localhost:", "http://[::1]:"))
+    proxies = None if local_target else ({"http": p, "https": p} if p else None)
+    resp = cffi.post(
+        f"{api_url}/api/accounts",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload, proxies=proxies, verify=False, timeout=timeout, impersonate="chrome110",
+    )
+    data = _safe_response_json(resp)
+    if resp.status_code not in (200, 201):
+        detail = data if isinstance(data, dict) else (resp.text or "")[:200]
+        return {"ok": False, "email": email, "error": f"HTTP {resp.status_code}: {detail}"}
+    if isinstance(data, dict) and _business_response_error(data):
+        return {"ok": False, "email": email, "error": str(_business_response_error(data))}
+    return {"ok": True, "email": email, "message": "ChatGPT2API 导入成功", "response": data}
 
 
 # ──────────────────────── 统一入口（注册完成后调用） ────────────────────────
@@ -653,66 +751,75 @@ def test_sub2api(cfg: dict) -> dict:
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
+                  chatgpt2api_cfg: Optional[dict] = None,
+                  proxy: str = "",
                   log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
     """注册完成后的可选导出入口。
 
-    步骤：
-      1. 检查两个目标是否有任一启用，全部未启用直接返回
-      2. 用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
-         （主项目最终保存的 access_token 是 NextAuth 风格的，CPA/SUB2API 不接受）
-      3. 用刷新后的 cred 走 CPA / SUB2API 导出
-
-    返回：
-        {"cpa": {...} 或 None, "sub2api": {...} 或 None, "any_attempted": bool}
+    - CPA 严禁无 RT 账号：没有 refresh_token 直接跳过 CPA（skipped_no_rt），不请求 session、不上传。
+    - SUB2API / ChatGPT2API 无 RT 也推：无 RT 时通过 chatgpt.com session 获取 access_token 再上传。
+    - 有 RT 直接用现有凭证，不调 refresh_token rotation。
     """
     log = log_fn or (lambda m, lvl="info": logger.info(m))
-    out: dict = {"cpa": None, "sub2api": None, "any_attempted": False}
+    out: dict = {"cpa": None, "sub2api": None, "chatgpt2api": None, "any_attempted": False}
 
     cpa_on = bool(cpa_cfg and cpa_cfg.get("enabled"))
     sub2_on = bool(sub2api_cfg and sub2api_cfg.get("enabled"))
-    if not (cpa_on or sub2_on):
+    c2a_on = bool(chatgpt2api_cfg and chatgpt2api_cfg.get("enabled"))
+    if not (cpa_on or sub2_on or c2a_on):
         return out
 
-    # ─ 关键：先用 refresh_token 换 Codex 风格 access_token ─
-    try:
-        log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
-        fresh = refresh_codex_token(cred.get("refresh_token", ""))
-        cred = {
-            **cred,
-            "access_token":  fresh["access_token"],
-            "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
-            "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
-        }
-        log(
-            f"[exporter] ✅ Codex token 刷新成功 "
-            f"(access_token len={len(fresh['access_token'])} "
-            f"id_token len={len(fresh.get('id_token') or '')})",
-            "ok",
-        )
-    except Exception as e:
-        log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
-        if cpa_on:
-            out["any_attempted"] = True
-            out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
-        if sub2_on:
-            out["any_attempted"] = True
-            out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
-        return out
+    has_rt = bool(cred.get("refresh_token"))
 
+    # 无 RT 时，只有 SUB2API / ChatGPT2API 需要 chatgpt.com session 兜底 access_token；
+    # CPA 严禁无 RT，不参与 session 兜底。
+    session_error = ""
+    if not has_rt and (sub2_on or c2a_on):
+        try:
+            log("[exporter] 无 refresh_token，调用 chatgpt.com session 获取 access_token...", "info")
+            session_cred = _fetch_chatgpt_session_access_token(cred, proxy=proxy)
+            cred = {**cred, **session_cred}
+            log("[exporter] ✅ chatgpt.com session access_token 获取成功", "ok")
+        except Exception as e:
+            session_error = f"chatgpt.com session 获取失败，未获得新的可用 access_token: {e}"
+            log(f"[exporter] ❌ {session_error}", "error")
+
+    # CPA：只接受有 refresh_token 的账号。
     if cpa_on:
         out["any_attempted"] = True
-        try:
-            out["cpa"] = export_to_cpa(cred, cpa_cfg, log_fn=log)
-        except Exception as e:
-            log(f"[CPA] 导出异常: {e}", "error")
-            out["cpa"] = {"ok": False, "error": str(e)}
+        if not has_rt:
+            out["cpa"] = {"ok": False, "status": "skipped", "skipped_no_rt": True,
+                          "error": "无 refresh_token，CPA 严禁无 RT 账号，已跳过"}
+            log("[CPA] 无 refresh_token，跳过（CPA 严禁无 RT）", "warn")
+        elif cred.get("access_token"):
+            try:
+                out["cpa"] = export_to_cpa(cred, cpa_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[CPA] 导出异常: {e}", "error")
+                out["cpa"] = {"ok": False, "error": str(e)}
+        else:
+            out["cpa"] = {"ok": False, "error": "有 RT 但未获取到 access_token，CPA 未上传", "skipped_no_token": True}
 
     if sub2_on:
         out["any_attempted"] = True
-        try:
-            out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
-        except Exception as e:
-            log(f"[SUB2API] 导出异常: {e}", "error")
-            out["sub2api"] = {"ok": False, "error": str(e)}
+        if cred.get("access_token") and not session_error:
+            try:
+                out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
+            except Exception as e:
+                log(f"[SUB2API] 导出异常: {e}", "error")
+                out["sub2api"] = {"ok": False, "error": str(e)}
+        else:
+            out["sub2api"] = {"ok": False, "error": session_error or "未获取到 access_token，SUB2API 未上传", "skipped_no_token": True}
+
+    if c2a_on:
+        out["any_attempted"] = True
+        if cred.get("access_token") and not session_error:
+            try:
+                out["chatgpt2api"] = export_to_chatgpt2api(cred, chatgpt2api_cfg, proxy=proxy, log_fn=log)
+            except Exception as e:
+                log(f"[ChatGPT2API] 导出异常: {e}", "error")
+                out["chatgpt2api"] = {"ok": False, "error": str(e)}
+        else:
+            out["chatgpt2api"] = {"ok": False, "error": session_error or "未获取到 access_token，ChatGPT2API 未上传", "skipped_no_token": True}
 
     return out

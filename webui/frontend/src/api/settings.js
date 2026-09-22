@@ -22,3 +22,7 @@ export const getSmsAllCountries = (provider = '') =>
 export const getExportConfig = () => http.get('/api/settings/export')
 export const saveExportConfig = (payload) => http.post('/api/settings/export', payload)
 export const testExport = (target) => http.post('/api/settings/export/test', { target })
+
+// ──────────────── Webhook 通知配置 ────────────────
+export const getWebhookConfig = () => http.get('/api/settings/webhook')
+export const saveWebhookConfig = (payload) => http.post('/api/settings/webhook', payload)

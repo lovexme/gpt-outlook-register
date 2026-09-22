@@ -74,8 +74,11 @@ class AutoLoopController:
         # 代理池 / 并发数
         self._proxy_pool: list[str] = []
         self._concurrency: int = 1
+        # 代理轮询计数器（每次取代理递增，避免同 IP 多号）
+        self._proxy_counter = 0
         # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
         self._target_count: int = 0
+        self._target_reserved: int = 0
 
     # ──────────────────────── 公共 API ────────────────────────
 
@@ -91,6 +94,7 @@ class AutoLoopController:
             self._started_at = time.time()
             self._registered_ok = 0
             self._registered_fail = 0
+            self._target_reserved = 0
             self._worker_status.clear()
             self._consecutive_network_fails = 0
             self._last_message = "auto-loop 启动"
@@ -98,6 +102,19 @@ class AutoLoopController:
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
+            # DB 设置兜底且优先：DB 里是健康检查器维护过的池（自动剔除连续失败节点），
+            # 前端 localStorage 可能残留旧池（含已移除的坏节点），以 DB 为准。
+            try:
+                import json as _json
+                raw = db.get_setting("proxy_pool", "")
+                if raw:
+                    pool = _json.loads(raw)
+                    if isinstance(pool, list):
+                        db_pool = [p for p in pool if p and isinstance(p, str)]
+                        if db_pool:
+                            self._proxy_pool = db_pool
+            except Exception:
+                pass
             # 目标成功数（0=不限量）
             self._target_count = max(0, int(self._options.get("target_count") or 0))
             # 启 manage 线程
@@ -185,7 +202,7 @@ class AutoLoopController:
                 "registered_fail": self._registered_fail,
                 "target_count": self._target_count,
                 "remaining": (
-                    max(0, self._target_count - self._registered_ok)
+                    max(0, self._target_count - self._target_reserved)
                     if self._target_count else None
                 ),
                 "concurrency": self._concurrency,
@@ -210,9 +227,15 @@ class AutoLoopController:
         self._broadcast("state", self._snapshot())
 
     def _proxy_for_worker(self, worker_id: int) -> str:
-        """按 worker_id 从代理池里挑一个代理。空池时回退到 options.proxy。"""
+        """从代理池取代理：每个注册轮换一个。空池时回退到 options.proxy。
+
+        计数器每次递增，确保连续注册用不同出口 IP（避免同 IP 多号被限速）。
+        """
         if self._proxy_pool:
-            return self._proxy_pool[worker_id % len(self._proxy_pool)]
+            with self._lock:
+                idx = self._proxy_counter % len(self._proxy_pool)
+                self._proxy_counter += 1
+            return self._proxy_pool[idx]
         return self._options.get("proxy", "") or ""
 
     def _record_finish(self, ok: bool, category: str):
@@ -294,10 +317,10 @@ class AutoLoopController:
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
         idle_round = 0
-        proxy = self._proxy_for_worker(worker_id)
-        logger.info(f"[worker-{worker_id}] 启动 (proxy={proxy or '直连'})")
 
         while True:
+            # 每次循环重取代理（轮询下一个）
+            proxy = self._proxy_for_worker(worker_id)
             # 检查停止
             if self._stop_event.is_set():
                 logger.info(f"[worker-{worker_id}] 已停止")
@@ -310,12 +333,9 @@ class AutoLoopController:
                 if self._stop_event.is_set():
                     return
 
-            # 目标数量闸门：已成功 + 在跑的（复用 _worker_status 当在跑数）≥ 目标 → 本 worker 退出
-            # 不新增易泄漏的计数器；_worker_status 已在锁内正常维护，最大限度压低超额
+            # 目标数量闸门：先快速检查，实际 reservation 在 claim 成功后完成。
             with self._lock:
-                if self._target_count and (
-                    self._registered_ok + len(self._worker_status) >= self._target_count
-                ):
+                if self._target_count and self._target_reserved >= self._target_count:
                     logger.info(
                         f"[worker-{worker_id}] 目标 {self._target_count} 已锁定，退出"
                     )
@@ -357,6 +377,15 @@ class AutoLoopController:
                 continue
             idle_round = 0
 
+            with self._lock:
+                if self._target_count and self._target_reserved >= self._target_count:
+                    if pooled:
+                        db.release_unused(account["email"], account.get("claim_token"))
+                    return
+                reserved = bool(self._target_count)
+                if reserved:
+                    self._target_reserved += 1
+
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
             if proxy:
@@ -368,7 +397,10 @@ class AutoLoopController:
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
                 if pooled:
-                    db.release_unused(account["email"])
+                    db.release_unused(account["email"], account.get("claim_token"))
+                if reserved:
+                    with self._lock:
+                        self._target_reserved = max(0, self._target_reserved - 1)
                 time.sleep(2)
                 continue
 
@@ -393,6 +425,9 @@ class AutoLoopController:
             with self._lock:
                 self._worker_status.pop(worker_id, None)
             self._record_finish(ok, category)
+            if reserved and not ok:
+                with self._lock:
+                    self._target_reserved = max(0, self._target_reserved - 1)
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
@@ -414,8 +449,6 @@ class AutoLoopController:
         """轮询 runs 表，等 run 跑完。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._stop_event.is_set():
-                return False, ""
             con = db._conn()
             cur = con.execute(
                 "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)

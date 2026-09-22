@@ -1,0 +1,234 @@
+"""Temp-Mail.org 临时邮箱 provider（免费，API 版）。
+
+API: https://web2.temp-mail.org
+  - POST /mailbox → 创建邮箱，返回 JWT token
+  - GET /mailbox → 获取邮箱信息
+  - GET /messages → 获取邮件列表
+
+能力：pooled=False（自己造地址，无限量）
+      ephemeral=True（每次新地址）
+"""
+from __future__ import annotations
+
+import logging
+import re
+import time
+from typing import Optional
+
+from curl_cffi import requests
+
+from .base import ConfigField, MailProvider, extract_otp, register
+
+logger = logging.getLogger(__name__)
+
+_API_BASE = "https://web2.temp-mail.org"
+_DEFAULT_DOMAIN = "beiwoh.com"
+
+@register
+class TempMailProvider(MailProvider):
+    """Temp-Mail.org 临时邮箱 provider。"""
+
+    kind = "tempmail"
+    display_name = "Temp-Mail 临时邮箱"
+    pooled = False
+    ephemeral = True
+
+    line_segments = 0
+    import_hint = ""
+    import_placeholder = ""
+
+    config_fields = [
+        ConfigField(
+            "tempmail_domain", "邮箱域名",
+            placeholder=_DEFAULT_DOMAIN,
+            help="temp-mail 域名，默认 beiwoh.com",
+        ),
+    ]
+
+    def __init__(self, domain: str = _DEFAULT_DOMAIN, proxy: Optional[str] = None):
+        self._domain = (domain or _DEFAULT_DOMAIN).strip()
+        self._proxy = proxy
+        self._email: str = ""
+        self._token: str = ""
+        self._session = requests.Session()
+        self._session.trust_env = False
+        if proxy:
+            norm = proxy
+            if norm.startswith("socks5://"):
+                norm = "socks5h://" + norm[len("socks5://"):]
+            self._session.proxies = {"http": norm, "https": norm}
+
+    @classmethod
+    def from_config(cls, settings: dict, account: Optional[dict] = None):
+        domain = (settings.get("tempmail_domain") or _DEFAULT_DOMAIN).strip()
+        proxy = (settings.get("proxy") or settings.get("tempmail_proxy") or "").strip() or None
+        return cls(domain=domain, proxy=proxy)
+
+    def create_mailbox(self) -> str:
+        """创建邮箱。每次强制从代理池轮换一个出口 IP（temp-mail 限流严格，不能连续打同一 IP）。
+
+        429 时换池里下一个代理重试（同一 IP 死等没意义）。
+        """
+        pool = [self._proxy] if self._proxy else []
+        if not pool:
+            try:
+                from webui import db
+                pool = db.get_proxy_pool()
+            except Exception:
+                pool = []
+        if not pool:
+            pool = [""]
+
+        def _use_proxy(chosen: str) -> None:
+            """把 session 切到指定代理。"""
+            self._session = requests.Session()
+            self._session.trust_env = False
+            norm = chosen
+            if norm.startswith("socks5://"):
+                norm = "socks5h://" + norm[len("socks5://"):]
+            self._session.proxies = {"http": norm, "https": norm}
+
+        # ─ 创建邮箱，429 换代理重试（最多试 3 个不同代理） ─
+        last_r = None
+        for _try in range(1, 4):
+            idx, chosen = _try - 1, pool[(_try - 1) % len(pool)]
+            logger.info(f"[tempmail] 创建邮箱 代理 #{idx}: {chosen.split('/')[0]}//...")
+            _use_proxy(chosen)
+
+            try:
+                self._session.get("https://temp-mail.org/zh/", impersonate="chrome120", timeout=15)
+                xsrf = self._session.cookies.get("XSRF-TOKEN", "")
+
+                local = "oc" + "".join(__import__("random").choices("0123456789abcdef", k=12))
+                r = self._session.post(
+                    f"{_API_BASE}/mailbox",
+                    impersonate="chrome120",
+                    headers={"Referer": "https://temp-mail.org/", "X-XSRF-TOKEN": xsrf},
+                    json={"email": f"{local}@{self._domain}"},
+                    timeout=15,
+                )
+                last_r = r
+                if r.status_code == 429:
+                    delay = 2 ** _try + __import__("random").random() * 2
+                    logger.warning(
+                        f"[tempmail] 429 限流（代理 #{idx}），{delay:.1f}s 后换下一个代理重试 ({_try}/3)"
+                    )
+                    time.sleep(delay)
+                    continue
+                # 200 → 成功
+                data = r.json()
+                self._token = data.get("token", "")
+                break
+            except Exception as e:  # noqa: BLE001
+                last_r = None
+                logger.warning(f"[tempmail] 创建邮箱异常（代理 #{idx}）: {e}，换下一个代理")
+                time.sleep(1 + __import__("random").random() * 2)
+                continue
+        else:
+            # 3 次都 429/异常
+            if last_r is not None:
+                raise RuntimeError(f"Temp-Mail 创建邮箱失败: {last_r.status_code} {last_r.text[:200]}")
+            raise RuntimeError("Temp-Mail 创建邮箱失败: 3 个代理均异常")
+        # 从 mailbox 接口获取实际邮箱
+        mb = self._session.get(
+            f"{_API_BASE}/mailbox",
+            impersonate="chrome120",
+            headers={"Authorization": f"Bearer {self._token}", "Referer": "https://temp-mail.org/"},
+            timeout=15,
+        )
+        if mb.status_code == 200:
+            self._email = mb.json().get("mailbox", "")
+
+        if not self._email:
+            raise RuntimeError("Temp-Mail 创建邮箱失败: 无法获取邮箱地址")
+
+        logger.info(f"[tempmail] 邮箱: {self._email}")
+        return self._email
+
+    def wait_for_otp(
+        self, email_addr: str, timeout: int = 120, issued_after: Optional[float] = None,
+    ) -> str:
+        """轮询等待 OTP。"""
+        timeout = max(int(timeout), 60)
+        deadline = time.time() + timeout
+        logger.info(f"[tempmail] 等待 OTP -> {email_addr} (timeout={timeout}s)")
+
+        seen = set()
+        while time.time() < deadline:
+            try:
+                r = self._session.get(
+                    f"{_API_BASE}/messages",
+                    impersonate="chrome120",
+                    headers={"Authorization": f"Bearer {self._token}", "Referer": "https://temp-mail.org/"},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for msg in data.get("messages", []):
+                        mid = msg.get("_id", "")
+                        if mid in seen:
+                            continue
+                        seen.add(mid)
+                        # 防串号：只处理 issued_after 之后到达的新邮件
+                        if issued_after is not None:
+                            received = msg.get("receivedAt") or 0
+                            if received < issued_after:
+                                logger.debug(
+                                    f"[tempmail] 跳过旧邮件 (received={received} < {issued_after})"
+                                )
+                                continue
+                        subject = msg.get("subject", "")[:50]
+                        logger.debug(f"[tempmail] 新邮件: {subject}")
+                        # 获取完整邮件内容
+                        try:
+                            detail_r = self._session.get(
+                                f"{_API_BASE}/messages/{mid}",
+                                impersonate="chrome120",
+                                headers={"Authorization": f"Bearer {self._token}", "Referer": "https://temp-mail.org/"},
+                                timeout=15,
+                            )
+                            detail = detail_r.json()
+                            content = (detail.get("bodyHtml") or detail.get("body_html") or
+                                       detail.get("bodyText") or detail.get("body_text") or
+                                       detail.get("bodyPreview") or detail.get("body") or
+                                       detail.get("html") or str(detail))
+                            # 提取所有 6 位数字 → 排除颜色值(#XXXXXX)和注释中的数字 → 取第一个
+                            candidates = re.findall(r"(?<!\d)(\d{6})(?!\d)", content)
+                            otp = None
+                            for c in candidates:
+                                # 检查前面是否有 # (颜色值)
+                                idx = content.find(c)
+                                if idx > 0 and content[idx-1] == '#':
+                                    continue
+                                # 检查是否在 HTML 注释中
+                                before = content[max(0,idx-20):idx]
+                                if '<!--' in before and '-->' not in before:
+                                    continue
+                                otp = c
+                                break
+                            if otp:
+                                logger.info(f"[tempmail] ✅ OTP={otp} from {subject}")
+                                return otp
+                            else:
+                                logger.debug(f"[tempmail] 未提取到 OTP，正文: {content[:300]}")
+                        except Exception as e:
+                            logger.warning(f"[tempmail] 获取详情失败: {e}")
+                            # 回退：从 bodyPreview 提取
+                            body_preview = msg.get("bodyPreview", "") or msg.get("body", "")
+                            otp_match = re.search(r"(?<!\d)(\d{6})(?!\d)", body_preview)
+                            if otp_match:
+                                otp = otp_match.group(1)
+                                logger.info(f"[tempmail] ✅ OTP={otp} from preview {subject}")
+                                return otp
+            except Exception as e:
+                logger.warning(f"[tempmail] poll 异常: {e}")
+            time.sleep(3)
+
+        raise TimeoutError(f"Temp-Mail OTP timeout {timeout}s for {email_addr}")
+
+    def self_test(self) -> dict:
+        try:
+            email = self.create_mailbox()
+            return {"ok": True, "message": f"连接成功，测试邮箱: {email}"}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}

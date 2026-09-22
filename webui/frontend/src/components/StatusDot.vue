@@ -3,6 +3,7 @@
 defineProps({
   type: { type: String, default: 'info' }, // success/warning/danger/primary/info
   text: { type: [String, Number], default: '' },
+  title: { type: String, default: '' },
 })
 const COLORS = {
   success: '#52c41a',
@@ -14,7 +15,7 @@ const COLORS = {
 </script>
 
 <template>
-  <span class="status-dot">
+  <span class="status-dot" :title="title || text">
     <i :style="{ background: COLORS[type] || COLORS.info }" />{{ text }}
   </span>
 </template>

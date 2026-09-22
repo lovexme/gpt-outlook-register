@@ -41,6 +41,14 @@ from .base import (  # noqa: F401
 from . import outlook        # noqa: F401,E402  kind="outlook"
 from . import cf_temp        # noqa: F401,E402  kind="cf_temp"
 from . import icloud_relay   # noqa: F401,E402  kind="icloud_relay"
+from . import tempmail      # noqa: F401,E402  kind="tempmail"
+from . import tempmail_proxy  # noqa: F401,E402  kind="tempmail_proxy"
+from . import tempamail      # noqa: F401,E402  kind="tempamail"
+from . import rapidapi_tempmail  # noqa: F401,E402  kind="rapidapi_tempmail"
+from . import tempo_mail      # noqa: F401,E402  kind="tempo"
+from . import tmaily          # noqa: F401,E402  kind="tmaily"
+from . import fmail           # noqa: F401,E402  kind="fmail"
+from . import duck            # noqa: F401,E402  kind="duck"
 
 __all__ = [
     "MailProvider",

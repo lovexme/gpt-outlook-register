@@ -4,9 +4,10 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
-  bulkDeleteRegistered, checkPlus,
+  bulkDeleteRegistered, checkPlus, checkFiltered,
   listExportFormats, exportRegistered,
-  listWithoutRefresh, refreshRefresh,
+  listWithoutRefresh, refreshRefresh, refreshAt,
+  getPeriodicCheck, setPeriodicCheck, fetchTotp, confirmPayment, pushSelected,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -21,10 +22,46 @@ const rows = ref([])
 const total = ref(0)
 const page = ref(1)
 const filter = ref('all')
+const search = ref('')
 const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
+const refreshingAt = ref(false)
+const refreshAtResult = ref('')
+const pushing = ref(false)
+const pushResult = ref('')
+const pushDialogVisible = ref(false)
+const pushTargets = ref({ cpa: true, sub2api: true, chatgpt2api: true })
+
+// ──────────── 定时检测 ────────────
+const periodic = ref({ enabled: true, interval_seconds: 3600 })
+const periodicLoading = ref(false)
+async function loadPeriodic() {
+  try {
+    const res = await getPeriodicCheck()
+    periodic.value = { enabled: res.enabled, interval_seconds: res.interval_seconds }
+  } catch (e) { /* 网络/旧后端忽略，默认开 */ }
+}
+async function togglePeriodic() {
+  periodicLoading.value = true
+  try {
+    const res = await setPeriodicCheck({ enabled: periodic.value.enabled })
+    periodic.value = { enabled: res.enabled, interval_seconds: res.interval_seconds }
+    ElMessage.success(periodic.value.enabled ? '已开启定时检测' : '已关闭定时检测')
+  } catch (e) { ElMessage.error('修改定时检测失败: ' + e.message) }
+  finally { periodicLoading.value = false }
+}
+async function changeInterval(val) {
+  periodicLoading.value = true
+  try {
+    const res = await setPeriodicCheck({ interval_seconds: Number(val) })
+    periodic.value = { enabled: res.enabled, interval_seconds: res.interval_seconds }
+    ElMessage.success(`检测间隔已设为 ${res.interval_seconds / 60} 分钟`)
+  } catch (e) { ElMessage.error('修改间隔失败: ' + e.message) }
+  finally { periodicLoading.value = false }
+}
+loadPeriodic()
 
 // ──────────── 补 refresh ────────────
 const refreshing = ref(false)
@@ -34,10 +71,57 @@ const refreshEmails = ref([])      // 待处理的邮箱列表
 const refreshDialogVisible = ref(false)
 
 const PLUS_TYPE = {
-  plus_eligible: 'success', plus_active: 'primary', free: 'warning',
-  banned: 'danger', error: 'danger',
+  free: 'info', banned: 'danger', check_error: 'danger',
 }
 function plusOf(row) { return row.plus_check || null }
+function planType(row) {
+  const check = plusOf(row)
+  if (!check) return 'info'
+  if (PLUS_TYPE[check.status]) return PLUS_TYPE[check.status]
+  if (check.status?.endsWith('_active')) return 'primary'
+  if (check.status?.endsWith('_eligible')) return 'success'
+  if (check.status?.endsWith('_discount') || check.status?.endsWith('_promo')) return 'warning'
+  return 'info'
+}
+
+function statusLabel(row) {
+  const check = plusOf(row)
+  if (!check) return '—'
+  if (check.status === 'free') return 'Free'
+  if (check.status === 'banned') return '封号'
+  if (check.status === 'token_expired' || check.status === 'unauthorized') return 'Token失效待刷新'
+  if (check.status === 'check_error') return '检测失败'
+
+  const PLAN_LABELS = { free: 'Free', plus: 'Plus', pro: 'Pro', go: 'Go', team: 'Team', business: 'Business', enterprise: 'Enterprise' }
+  const parts = check.status.split('_')
+  const plan = parts[0]
+  const suffix = parts.slice(1).join('_')
+  const planLabel = PLAN_LABELS[plan] || plan
+
+  if (suffix === 'active') return `${planLabel}已开通`
+  if (suffix === 'eligible') {
+    const dur = check.offers?.[0]?.duration_label
+    return dur ? `${planLabel}可试用 ${dur}` : `${planLabel}可试用`
+  }
+  if (suffix === 'discount' || suffix === 'promo') {
+    const dur = check.offers?.[0]?.duration_label
+    return dur ? `${planLabel}优惠 ${dur}` : `${planLabel}优惠`
+  }
+  return check.label || check.status || '—'
+}
+
+function exitIpParts(row) {
+  const raw = String(row.exit_ip || '')
+  const slash = raw.indexOf('/')
+  if (slash > 0) return { country: raw.slice(0, slash), ip: raw.slice(slash + 1) }
+  return { country: '', ip: raw }
+}
+
+function countryFlag(code) {
+  const cc = String(code || '').trim().toUpperCase()
+  if (!/^[A-Z]{2}$/.test(cc)) return '🌐'
+  return String.fromCodePoint(...[...cc].map((c) => 127397 + c.charCodeAt(0)))
+}
 
 async function load(resetPage) {
   if (resetPage) page.value = 1
@@ -45,6 +129,7 @@ async function load(resetPage) {
   try {
     const { items, total: t } = await listRegistered({
       limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE, filter: filter.value,
+      search: search.value,
     })
     rows.value = items
     total.value = t
@@ -77,6 +162,25 @@ async function doCheck(mode) {
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
+  } finally { checking.value = false }
+}
+
+async function doCheckFiltered() {
+  checking.value = true
+  checkResult.value = '按当前筛选检测中...'
+  try {
+    const { total: checked, results } = await checkFiltered(filter.value, search.value.trim())
+    let active = 0, free = 0, banned = 0
+    for (const info of Object.values(results)) {
+      if (info.status?.endsWith('_active')) active++
+      else if (info.status === 'free') free++
+      else if (info.status === 'banned') banned++
+    }
+    checkResult.value = `完成: ${checked} 个，${active} 已开通，${free} Free，${banned} 封号`
+    await load(false)
+  } catch (e) {
+    checkResult.value = ''
+    ElMessage.error('检测当前筛选失败: ' + e.message)
   } finally { checking.value = false }
 }
 
@@ -124,17 +228,17 @@ async function doRefresh(mode) {
       total: emails.length,
       started: started.length,
       failed: Object.keys(failed || {}).length,
-      done: emails.length,
+      done: 0,
     }
-    const parts = [`已完成: ${started.length} 个启动成功`]
+    const parts = [`已入队: ${started.length} 个，后台单 worker 执行中`]
     if (Object.keys(failed || {}).length) {
       parts.push(`${Object.keys(failed).length} 个失败`)
     }
     refreshResult.value = parts.join(', ')
     if (Object.keys(failed || {}).length) {
-      ElMessage.warning(`${Object.keys(failed).length} 个号启动失败，请查看详情`)
+      ElMessage.warning(`${Object.keys(failed).length} 个号未入队，请查看详情`)
     } else {
-      ElMessage.success(`${started.length} 个号已启动补 refresh`)
+      ElMessage.success(`${started.length} 个号已入队，后台执行中`)
     }
     load(false)
   } catch (e) {
@@ -143,6 +247,99 @@ async function doRefresh(mode) {
   } finally { refreshing.value = false }
 }
 
+// ──────────── 刷新 AT（重登录换新 access_token + 纠正状态） ────────────
+async function doRefreshAt(mode) {
+  let emails = []
+  if (mode === 'selected') {
+    emails = selected.value.map((r) => r.email)
+    if (!emails.length) { ElMessage.info('请先勾选要刷新的号'); return }
+  } else {
+    emails = rows.value.map((r) => r.email)
+    if (!emails.length) { ElMessage.info('当前页没有可刷新的号'); return }
+  }
+  const ok = await confirm(
+    `对 ${emails.length} 个号重登录刷新 access_token？\n`
+    + `（用 DB 里的密码+2FA 重新登录换新 AT，并纠正 Plus 状态。`
+    + `开通 Plus 后旧 AT 会 401 被面板误标封号，刷新即可恢复。）`,
+  )
+  if (!ok) return
+  refreshingAt.value = true
+  refreshAtResult.value = `刷新 AT 中... 0/${emails.length}`
+  try {
+    const { refreshed, failed, results } = await refreshAt(
+      emails,
+      form.value.proxy.trim(),
+    )
+    const okN = (refreshed || []).length
+    const failN = Object.keys(failed || {}).length
+    const parts = [`完成: ${okN} 成功`]
+    if (failN) parts.push(`${failN} 失败`)
+    refreshAtResult.value = parts.join(', ')
+    if (failN) {
+      ElMessage.warning(`${failN} 个号刷新失败：${Object.values(failed).join('; ')}`)
+    } else {
+      ElMessage.success(`${okN} 个号 AT 已刷新`)
+    }
+    load(false)
+  } catch (e) {
+    refreshAtResult.value = ''
+    ElMessage.error('刷新 AT 失败: ' + e.message)
+  } finally { refreshingAt.value = false }
+}
+
+// ──────────── 手动推送选中（弹出可选面板，勾选目标后直接推送） ────────────
+function doPush() {
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) { ElMessage.info('请先勾选要推送的号'); return }
+  pushTargets.value = { cpa: true, sub2api: true, chatgpt2api: true }
+  pushDialogVisible.value = true
+}
+
+async function submitPush() {
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) { ElMessage.info('请先勾选要推送的号'); return }
+  const targets = Object.keys(pushTargets.value).filter((k) => pushTargets.value[k])
+  if (!targets.length) { ElMessage.warning('请至少勾选一个目标面板'); return }
+  pushDialogVisible.value = false
+  pushing.value = true
+  pushResult.value = `推送中... 0/${emails.length}`
+  try {
+    const response = await pushSelected(
+      emails, form.value.proxy.trim(), targets,
+    )
+    const accountStats = response.account_stats || {
+      all_success: response.all_success ?? 0,
+      partial_success: response.partial_success ?? 0,
+      all_failed: response.all_failed ?? 0,
+    }
+    const okCount = accountStats.all_success
+    const failedCount = accountStats.partial_success + accountStats.all_failed
+    const parts = [`全部成功 ${accountStats.all_success} / 部分成功 ${accountStats.partial_success} / 全部失败 ${accountStats.all_failed}`]
+    const byTarget = response.by_target || response.target_stats || {}
+    for (const [target, stat] of Object.entries(byTarget)) {
+      if (!stat || typeof stat !== 'object') continue
+      const label = { cpa: 'CPA', sub2api: 'SUB2API', chatgpt2api: 'ChatGPT2API' }[target] || target
+      const ok = stat.ok ?? stat.accepted ?? stat.success ?? 0
+      const fail = stat.fail ?? stat.failed ?? 0
+      const skip = stat.skip_no_rt ?? stat.skipped_no_rt ?? 0
+      parts.push(`${label}: ${ok}成功${fail}失败${skip ? `,${skip}无RT` : ''}`)
+    }
+    pushResult.value = parts.join('  ')
+    const fails = []
+    for (const v of Object.values(response.results || {})) {
+      for (const r of Object.values(v.targets || v)) if (r && typeof r === 'object' && !r.ok && !r.skipped_no_rt && r.error) fails.push(r.error)
+    }
+    if (failedCount > 0) {
+      ElMessage.warning(`${failedCount} 个账号推送未全部成功${fails.length ? `: ${fails.slice(0, 5).join('; ')}` : ''}`)
+    } else {
+      ElMessage.success(`${okCount} 个账号全部推送成功`)
+    }
+    load(false)
+  } catch (e) {
+    pushResult.value = ''
+    ElMessage.error('推送失败: ' + e.message)
+  } finally { pushing.value = false }
+}
 async function confirm(msg) {
   try { await ElMessageBox.confirm(msg, '确认', { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' }); return true }
   catch (_) { return false }
@@ -163,6 +360,11 @@ async function deleteAll() {
   if (!(await confirm('这会清空注册结果表里的所有凭证！邮箱列表不受影响，确定？'))) return
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
   try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
+  catch (e) { ElMessage.error(e.message) }
+}
+async function deleteBanned() {
+  if (!(await confirm('确定清空所有封号账号？此操作不可恢复！'))) return
+  try { const r = await bulkDeleteRegistered({ status: 'banned' }); ElMessage.success(`已清空 ${r.deleted} 个封号`); load() }
   catch (e) { ElMessage.error(e.message) }
 }
 
@@ -211,6 +413,10 @@ async function doExport(fmt) {
   finally { exporting.value = false }
 }
 
+async function handleExportCommand(command) {
+  return doExport(command)
+}
+
 function b64ToBytes(b64) {
   const bin = atob(b64 || '')
   const bytes = new Uint8Array(bin.length)
@@ -238,7 +444,7 @@ function downloadExport() {
 const credVisible = ref(false)
 const credEmail = ref('')
 const credData = ref(null)
-const CRED_KEYS = ['access_token', 'session_token', 'refresh_token', 'id_token', 'device_id', 'csrf_token', 'cookie_header', 'password']
+const CRED_KEYS = ['access_token', 'session_token', 'refresh_token', 'id_token', 'device_id', 'csrf_token', 'cookie_header', 'password', 'totp_secret']
 const credRows = computed(() => {
   if (!credData.value) return []
   return CRED_KEYS.filter((k) => credData.value[k]).map((k) => ({ key: k, val: credData.value[k] }))
@@ -262,6 +468,43 @@ async function copyCell(email, field) {
 function copyAllJson() {
   if (credData.value) copyText(JSON.stringify(credData.value, null, 2))
 }
+async function calcTotp(email) {
+  try {
+    const res = await fetchTotp(email)
+    await copyText(res.code)
+    ElMessage.success(`TOTP: ${res.code}（${res.expires_in}s 后失效，已复制）`)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '算码失败')
+  }
+}
+
+const confirmUrl = ref('')
+const confirmDialogVisible = ref(false)
+const confirmResult = ref('')
+const confirmEmail = ref('')
+const confirming = ref(false)
+async function doConfirmPayment(row) {
+  confirmEmail.value = row.email
+  confirmUrl.value = ''
+  confirmResult.value = ''
+  confirmDialogVisible.value = true
+}
+async function submitConfirmPayment() {
+  if (!confirmUrl.value) { ElMessage.warning('请输入回调地址'); return }
+  confirming.value = true
+  confirmResult.value = '处理中...'
+  try {
+    const res = await confirmPayment(confirmEmail.value, confirmUrl.value)
+    if (res.ok) {
+      confirmResult.value = res.message + '\n' + JSON.stringify(res.detail || {}, null, 2)
+    } else {
+      confirmResult.value = res.message + '\n' + (res.errors || []).join('\n')
+    }
+  } catch (e) {
+    confirmResult.value = '请求失败: ' + (e?.response?.data?.detail || e?.message || '未知错误')
+  }
+  confirming.value = false
+}
 
 watch(page, () => load())
 watch(dataVersion, () => load())
@@ -274,16 +517,27 @@ onActivated(() => load())
 
       <el-space wrap style="margin-bottom: 12px">
         <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
+        <el-input
+          v-model="search" placeholder="搜索邮箱" clearable style="width: 200px"
+          @keyup.enter="load(true)" @clear="load(true)"
+        >
+          <template #prefix><el-icon><Search /></el-icon></template>
+        </el-input>
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
           <el-option label="有 RT" value="has_rt" />
-          <el-option label="无 RT" value="no_rt" />
+          <el-option label="无 AT" value="no_at" />
           <el-option label="未检测" value="unchecked" />
+          <el-option label="已开通" value="active" />
           <el-option label="Free" value="free" />
-          <el-option label="可领Plus" value="plus" />
+          <el-option label="Plus" value="plus" />
+          <el-option label="Pro" value="pro" />
+          <el-option label="Go" value="go" />
+          <el-option label="Team" value="team" />
           <el-option label="已封号" value="banned" />
         </el-select>
         <el-button :loading="checking" @click="doCheck('unchecked')">检查未检测</el-button>
+        <el-button :loading="checking" type="primary" @click="doCheckFiltered">检测当前筛选</el-button>
         <el-button :loading="checking" @click="doCheck('all')">重新检查</el-button>
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
           检测选中 ({{ selected.length }})
@@ -291,18 +545,24 @@ onActivated(() => load())
         <el-button :loading="refreshing" type="warning" plain @click="doRefresh(selected.length ? 'selected' : '')">
           <el-icon><Refresh /></el-icon>补 refresh{{ selected.length ? ` (${selected.length})` : '' }}
         </el-button>
+        <el-button :loading="refreshingAt" type="success" plain @click="doRefreshAt(selected.length ? 'selected' : '')">
+          <el-icon><RefreshRight /></el-icon>刷新AT{{ selected.length ? ` (${selected.length})` : '' }}
+        </el-button>
+        <el-button :loading="pushing" type="primary" plain :disabled="!selected.length" @click="doPush">
+          <el-icon><Position /></el-icon>推送选中 ({{ selected.length }})
+        </el-button>
         <el-divider direction="vertical" />
-        <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
+        <el-dropdown trigger="click" @command="handleExportCommand" @visible-change="(v) => v && loadExportFormats()">
           <el-button :loading="exporting">
             <el-icon><Download /></el-icon>{{ exportBtnText }}
             <el-icon class="el-icon--right"><ArrowDown /></el-icon>
           </el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item v-for="f in exportFormats" :key="f.id" :command="f" :divided="f.mode === 'download' && f.id === 'cpa'">
-                {{ f.label }}
-                <span v-if="f.note" class="hint" style="margin-left: 6px">{{ f.note }}</span>
-              </el-dropdown-item>
+            <el-dropdown-item v-for="f in exportFormats" :key="f.id" :command="f">
+              {{ f.label }}
+              <span v-if="f.note" class="hint" style="margin-left: 6px">{{ f.note }}</span>
+            </el-dropdown-item>
               <el-dropdown-item v-if="!exportFormats.length" disabled>加载中...</el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -312,8 +572,28 @@ onActivated(() => load())
           删除选中 ({{ selected.length }})
         </el-button>
         <el-button type="danger" plain @click="deleteAll">清空全部</el-button>
+        <el-button type="danger" plain @click="deleteBanned">清空封号</el-button>
+        <el-divider direction="vertical" />
+        <el-switch
+          v-model="periodic.enabled" :loading="periodicLoading"
+          @change="togglePeriodic" style="margin-right: 8px"
+        />
+        <el-select
+          :model-value="periodic.interval_seconds" style="width: 110px"
+          @change="changeInterval"
+        >
+          <el-option label="30分钟" :value="1800" />
+          <el-option label="1小时" :value="3600" />
+          <el-option label="2小时" :value="7200" />
+          <el-option label="6小时" :value="21600" />
+          <el-option label="12小时" :value="43200" />
+          <el-option label="24小时" :value="86400" />
+        </el-select>
+        <span class="hint">定时检测</span>
         <span class="hint">{{ checkResult }}</span>
         <span v-if="refreshResult" class="hint" style="margin-left: 8px; color: var(--el-color-warning)">{{ refreshResult }}</span>
+        <span v-if="refreshAtResult" class="hint" style="margin-left: 8px; color: var(--el-color-success)">{{ refreshAtResult }}</span>
+        <span v-if="pushResult" class="hint" style="margin-left: 8px; color: var(--el-color-primary)">{{ pushResult }}</span>
       </el-space>
 
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
@@ -323,23 +603,58 @@ onActivated(() => load())
         @selection-change="(v) => (selected = v)"
       >
         <el-table-column type="selection" width="44" />
-        <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
-        <!-- 密码直接明文列出：随机 16 位，是登录账号的必需品，
-             藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。 -->
-        <el-table-column label="密码" min-width="170">
+        <el-table-column label="邮箱" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
             <el-button
-              v-if="row.password" size="small" text type="primary"
-              class="mono" style="font-size: 12px" @click="copyText(row.password)"
+              v-if="row.email" size="small" text type="primary"
+              class="registered-email mono" @click="copyText(row.email)"
             >
-              <el-icon><CopyDocument /></el-icon>{{ row.password }}
+              <el-icon><CopyDocument /></el-icon>{{ row.email }}
             </el-button>
+            <span class="registered-time">注册于 {{ fmtTime(row.created_at) }}</span>
+          </template>
+        </el-table-column>
+        <!-- 默认遮掩敏感值；点击仍复制完整密码 / TOTP，不额外增加列。 -->
+        <el-table-column label="密码" min-width="180">
+          <template #default="{ row }">
+            <div class="mono" style="font-size: 12px; line-height: 1.6">
+              <el-button
+                v-if="row.password" size="small" text type="primary"
+                class="mono" style="font-size:inherit" @click="copyText(row.password)"
+              >
+                <el-icon><CopyDocument /></el-icon>••••••••
+              </el-button>
+              <span v-else class="hint" style="font-size:inherit">—</span>
+              <br v-if="row.password && row.totp_secret" />
+              <el-button
+                v-if="row.totp_secret" size="small" text type="primary"
+                class="mono" style="font-size:inherit" @click="copyText(row.totp_secret)"
+              >
+                ••••••••
+              </el-button>
+              <el-button
+                v-if="row.totp_secret" size="small" text type="primary"
+                style="font-size: 11px; margin-left: 2px; padding: 0 4px" @click="calcTotp(row.email)"
+              >算</el-button>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="Plus状态" width="130">
+          <template #default="{ row }">
+            <span v-if="plusOf(row)" :class="['registered-plus-status', `status-${planType(row)}`]">
+              <StatusDot :type="planType(row)" :text="statusLabel(row)" />
+            </span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="Plus状态" width="120">
+        <el-table-column label="出口IP" width="130">
           <template #default="{ row }">
-            <StatusDot v-if="plusOf(row)" :type="PLUS_TYPE[plusOf(row).status] || 'info'" :text="plusOf(row).label" />
+            <span v-if="row.exit_ip" class="exit-ip-stack">
+              <span class="exit-ip-country">
+                {{ countryFlag(exitIpParts(row).country) }} {{ exitIpParts(row).country || 'IP' }}
+              </span>
+              <span class="mono exit-ip-value">{{ exitIpParts(row).ip }}</span>
+            </span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
@@ -367,13 +682,11 @@ onActivated(() => load())
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="时间" width="160">
-          <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
-        </el-table-column>
         <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
             <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            <el-button size="small" text @click="doConfirmPayment(row)">回调</el-button>
           </template>
         </el-table-column>
         <template #empty>
@@ -425,6 +738,66 @@ onActivated(() => load())
         </div>
         <el-empty v-if="!credRows.length" description="无凭证字段" />
       </el-dialog>
+
+      <el-dialog v-model="confirmDialogVisible" title="回调支付" width="640px" top="8vh" :close-on-click-modal="false">
+        <template #header>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <span class="mono" style="font-weight: 600">{{ confirmEmail }}</span>
+          </div>
+        </template>
+        <div style="margin-bottom: 12px">
+          <div style="margin-bottom: 6px; font-size: 13px; color: #666">
+            粘贴 Adyen 回调地址或 chatgpt.com/checkout/verify? 完整地址
+          </div>
+          <el-input
+            v-model="confirmUrl" type="textarea" :rows="3" placeholder="https://checkoutshopper-live.adyen.com/..."
+            :disabled="confirming" style="margin-bottom: 10px"
+          />
+          <el-button type="primary" :loading="confirming" @click="submitConfirmPayment" :disabled="!confirmUrl">
+            "执行回调"
+          </el-button>
+        </div>
+        <div v-if="confirmResult" :class="confirmResult.startsWith('✅') ? 'result-success' : 'result-fail'"
+          style="margin-top: 10px; padding: 12px; border-radius: 6px; background: #f5f7fa; white-space: pre-wrap; font-size: 13px; max-height: 300px; overflow: auto">
+          {{ confirmResult }}
+        </div>
+      </el-dialog>
+
+      <el-dialog v-model="pushDialogVisible" title="推送选中到面板" width="480px" top="12vh" :close-on-click-modal="false">
+        <div style="margin-bottom: 8px; color: #666; font-size: 13px">
+          将推送选中的 <b>{{ selected.length }}</b> 个号到勾选的目标面板。
+          CPA 严禁无 RT 账号（无 RT 自动跳过）；SUB2API / ChatGPT2API 无 RT 也会推送。
+        </div>
+        <el-checkbox v-model="pushTargets.cpa" style="margin: 4px 0">CPA 面板（仅限有 RT 账号）</el-checkbox><br />
+        <el-checkbox v-model="pushTargets.sub2api" style="margin: 4px 0">SUB2API 面板</el-checkbox><br />
+        <el-checkbox v-model="pushTargets.chatgpt2api" style="margin: 4px 0">ChatGPT2API 面板</el-checkbox>
+        <template #footer>
+          <el-button @click="pushDialogVisible = false">取消</el-button>
+          <el-button type="primary" :loading="pushing" @click="submitPush">确定推送</el-button>
+        </template>
+      </el-dialog>
     </el-card>
   </div>
 </template>
+
+<style scoped>
+.registered-email { font-weight: 600; line-height: 1.45; }
+.registered-time { display: block; margin-top: 3px; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.35; }
+.exit-ip-stack,
+.token-stack { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; line-height: 1.25; white-space: nowrap; }
+.exit-ip-country,
+.token-label { color: var(--el-text-color-secondary); font-size: 11px; font-weight: 600; }
+.exit-ip-value { color: var(--el-text-color-regular); font-size: 12px; }
+.token-stack :deep(.el-button) { height: auto; min-height: 20px; padding: 0 3px; line-height: 1.25; }
+.token-stack { min-width: 58px; padding: 2px 5px; }
+.token-label { display: block; line-height: 1.2; }
+.token-stack :deep(.el-button) { display: flex; align-items: center; justify-content: center; margin: 0 auto; }
+.registered-plus-status { display: inline-flex; padding: 5px 8px; border-radius: 6px; white-space: nowrap; }
+.registered-plus-status :deep(.status-dot) { gap: 6px; font-weight: 600; }
+.registered-plus-status :deep(.status-dot i) { width: 7px; height: 7px; }
+.registered-plus-status.status-success { color: #16885d; background: #eaf9f2; }
+.registered-plus-status.status-primary { color: #3876d0; background: #edf4ff; }
+.registered-plus-status.status-warning { color: #b87812; background: #fff5df; }
+.registered-plus-status.status-danger { color: #d34d62; background: #ffedf0; }
+.registered-plus-status.status-info { color: #687589; background: #f0f2f5; }
+</style>

@@ -59,9 +59,12 @@ FORMATS: list[ExportFormat] = [
     ),
     ExportFormat(
         id="email_pw",
-        label="邮箱----密码",
-        filename="账号密码.txt",
-        render=lambda r: f'{_s(r, "email")}----{_s(r, "password")}',
+        label="邮箱----密码----2FA",
+        filename="账号密码2FA.txt",
+        render=lambda r: (
+            f'{_s(r, "email")}----{_s(r, "password")}----'
+            f'{str((r.get("extra") or {}).get("totp_secret") or "").strip()}'
+        ),
     ),
 ]
 

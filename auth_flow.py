@@ -8,11 +8,13 @@
 import json
 import base64
 import hashlib
+import hmac
 import logging
 import os
 import random
 import re
 import secrets
+import struct
 import subprocess
 import time
 import uuid
@@ -28,6 +30,22 @@ from http_client import create_http_session, USER_AGENT
 logger = logging.getLogger(__name__)
 
 
+# ── RFC 6238 TOTP 实现（用于 mfa-challenge 计算动态码）────────────
+def _hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
+    """HOTP 算法（RFC 4226）"""
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
+    msg = struct.pack(">Q", counter)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def _totp_now(secret_b32: str) -> str:
+    """当前 30 秒窗口的 6 位 TOTP 码"""
+    return _hotp(secret_b32, int(time.time()) // 30)
+
+
 class AuthResult:
     """认证结果"""
 
@@ -41,6 +59,7 @@ class AuthResult:
         self.id_token: str = ""
         self.refresh_token: str = ""
         self.cookie_header: str = ""
+        self.totp_secret: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -56,6 +75,7 @@ class AuthResult:
             "id_token": self.id_token,
             "refresh_token": self.refresh_token,
             "cookie_header": self.cookie_header,
+            "totp_secret": self.totp_secret,
         }
 
 
@@ -68,6 +88,8 @@ class AuthFlow:
         sms_callback: Optional[Any] = None,
         env_overrides: Optional[dict] = None,
         on_password: Optional[Any] = None,
+        account_callback: Optional[Any] = None,
+        allow_existing_login: bool = False,
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -98,6 +120,11 @@ class AuthFlow:
         # ⚠️ 协议层不认识 webui.db，所以只给回调，"存哪"留给调用方决定，
         #    auth_flow 单独当 CLI 用时不传就是了，行为和以前一模一样。
         self._on_password = on_password
+        # 账号凭证回调：已有账号登录时从数据库加载密码和 totp_secret。
+        # 签名 (email: str) -> dict，返回 {"password": "...", "totp_secret": "..."}。
+        # 用于 mfa-challenge 路径：密码验证后需要 TOTP 码，从库里读 secret。
+        self._account_callback = account_callback
+        self._allow_existing_login = allow_existing_login
         self._http_trace_enabled = str(os.getenv("AUTH_HTTP_TRACE", "0")).lower() in ("1", "true", "yes", "on")
         # signup() 会在分支里 set；run_protocol_login 命中已有账号路径会跳过 signup，
         # 导致 kickoff_otp_delivery 读未初始化属性 AttributeError。这里给个默认值。
@@ -1344,7 +1371,7 @@ class AuthFlow:
                     )
 
             if not callback_url:
-                logger.debug("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:180])
+                logger.info("Codex OAuth 未捕获 callback code, final=%s", (final_url or "")[:300])
                 return False
             return self._exchange_codex_callback_code(
                 callback_url=callback_url,
@@ -1548,23 +1575,137 @@ class AuthFlow:
         headers.update(self._datadog_trace_headers())
         return headers
 
+    def _navigation_headers(self) -> dict:
+        """文档导航请求（地址栏直达那种）的头，含 client hints。
+
+        和 _common_headers 的区别只在 Sec-Fetch-* 那组：那边是 XHR（empty/cors/
+        same-origin），这里是整页导航（document/navigate/none + user + UIR）。
+        **client hints 两边必须一致**，都从 self._fingerprint 取：Chrome 指纹发
+        全套，Safari/Firefox 指纹 sec_ch_ua 为空串、一个都不发——这正是真实浏览器
+        的行为。旧 warmup 手搓头漏了这段，导致 Chrome UA 裸奔，实测 403 率 4/5，
+        补齐后 5/5 通过（详见 warmup docstring）。
+        """
+        fp = self._fingerprint
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": fp["lang_full"],
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "priority": "u=0, i",
+            "User-Agent": self._ua,
+        }
+        if fp.get("sec_ch_ua"):
+            headers["sec-ch-ua"] = fp["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+            headers["sec-ch-ua-platform"] = fp["sec_ch_ua_platform"]
+            for key, name in (
+                ("sec_ch_ua_full_version_list", "sec-ch-ua-full-version-list"),
+                ("sec_ch_ua_arch", "sec-ch-ua-arch"),
+                ("sec_ch_ua_bitness", "sec-ch-ua-bitness"),
+                ("sec_ch_ua_model", "sec-ch-ua-model"),
+                ("sec_ch_ua_platform_version", "sec-ch-ua-platform-version"),
+            ):
+                if fp.get(key):
+                    headers[name] = fp[key]
+        return headers
+
+    
     def warmup(self) -> bool:
-        """GET chatgpt.com 首页获取 __cf_bm cookie（Cloudflare 预热 + 连通性验证）。"""
-        try:
-            resp = self.session.get("https://chatgpt.com", headers={
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1",
-                "User-Agent": self._ua,
-            }, timeout=15)
-            logger.info("chatgpt.com warmup 完成")
-            return True
-        except Exception as e:
-            logger.warning(f"Cloudflare warmup 失败: {e}")
-            return False
+        """GET chatgpt.com 种全套 cookie（含 oai-did），成功返回 True。
+
+        为什么这步不能失败（2026-08-10 实测 26 轮，跨 40+ 出口 IP）：
+        `POST /api/auth/signin/openai` 依据 chatgpt.com 的 cookie 决定返回什么——
+        有 oai-did 就返 auth.openai.com/authorize URL，没有就返 NextAuth 页，
+        后者到 authorize/continue 必然 409 invalid_state。
+        实测：无 oai-did 的 5 轮 **5/5 全 409**；有 oai-did 的 17 轮只有 3 次 409。
+
+        旧实现两个问题，实测各占一半失败：
+        1. 单次无重试 + timeout=15。实测种 cookie 失败率 19%，形态有三种：
+           TLS curl(35) 断连、15s 超时、CF 403。成功轮实际耗时 3.4~10.9s，
+           15s 卡边缘，40s 才有富余。
+        2. **返回值和实际结果对不上**：只 catch 异常，不看 status_code——
+           403 照样 return True（实测 3 轮 True 但没 cookie），
+           而超时前 cookie 其实已经种上了却 return False（实测 1 轮）。
+           所以判据改成直接查 cookie jar，这是唯一可信的信号。
+
+        3. **没发 client hints，自称 Chrome 却不带 sec-ch-ua —— CF 一眼假。**
+           这是 403 的真因。真 Chrome 每个导航请求必带 sec-ch-ua/-mobile/-platform，
+           而旧 warmup 是手搓 headers、一个都没带（_common_headers 带了，只有这里漏）。
+           2026-08-10 实测，同一 impersonate 各打 5 次（每次新 IP）：
+
+               impersonate   裸头(旧)   补 CH 全套
+               chrome146      1/5        5/5
+               chrome136      1/5        5/5
+               chrome142      4/5        4/5   ← 唯一失败是 SSL 断连，不是 403
+
+           补齐后 403 **全部消失**。此前"chrome 族被 CF 拦"的结论是误判：
+           safari/firefox 当时 4/4 不是因为它们更干净，而是**它们本来就不该发
+           client hints**，裸头对它们恰好是正确的头。所以修法是把头补齐，
+           不是换成 safari —— 换指纹只是绕开症状，且会让 self._fingerprint 与
+           self._ua 不一致（后续 _common_headers 会拿旧家族的 CH 配新 UA，更假）。
+
+        重试只换出口 IP，不换指纹（指纹本来就没问题，见上）：代理池按会话分配
+        出口，新 session ≈ 新 IP，绕开连不上的坏 IP。cookie 跟着 session 一起
+        清掉是对的：失败轮本来就没种到有用的东西。
+
+        注：URL 保持首页 `/`。实测对比过 `/auth/login`（16 轮 vs 10 轮），
+        失败率 18.75% vs 20%，无差异，不值得换。
+
+        【最终验证 2026-08-10】本处 + auth_oauth_init + _follow_redirects 三处
+        统一走 _navigation_headers 后，用真实 CF 域名跑完整 run_register
+        **3/3 全成功**（各约 100s，password + access_token 齐全），409 = 0。
+        """
+        headers = self._navigation_headers()
+        last_status = None
+
+        for attempt in range(8):
+            if attempt:
+                # 只换出口 IP（新 session = 新出口），指纹保持不变：
+                # 403 是 CF 对单 IP 的瞬时风控（换 IP 恢复率极高），快速重试；
+                # 其余错误（超时/断连）才按指数等待。
+                time.sleep(1 if last_status == 403 else 3 + attempt * 2)
+                self.session = create_http_session(
+                    proxy=self.config.proxy,
+                    impersonate=self._impersonate_candidates[self._impersonate_idx],
+                    user_agent=self._ua,
+                )
+            try:
+                resp = self.session.get(
+                    "https://chatgpt.com", headers=headers, timeout=40,
+                )
+                status = resp.status_code
+                last_status = status
+            except Exception as e:
+                status = None
+                last_status = None
+                logger.warning(f"warmup 第 {attempt + 1}/8 次请求失败: {e}")
+
+            # 唯一判据：cookie 到底种上没有。HTTP 200 不代表拿到 oai-did（CF 403 只给
+            # __cf_bm），请求抛异常也不代表没拿到（超时前可能已经种上了）。
+            try:
+                cookies = self.session.cookies.get_dict()
+            except Exception:
+                cookies = {}
+            if "oai-did" in cookies:
+                logger.info(
+                    f"chatgpt.com warmup 完成（第 {attempt + 1} 次，oai-did 已种，"
+                    f"共 {len(cookies)} 个 cookie）"
+                )
+                return True
+
+            logger.warning(
+                f"warmup 第 {attempt + 1}/4 次未种到 oai-did"
+                + (f"（HTTP {status}）" if status is not None else "")
+                + (f"，已有 cookie: {sorted(cookies)}" if cookies else "，无任何 cookie")
+            )
+
+        logger.error("warmup 4 次均未种到 oai-did cookie —— 此时继续走注册链必然 409 invalid_state")
+        return False
 
     # ── Step 1: 检查代理连通性 ──
     def check_proxy(self) -> bool:
@@ -1685,12 +1826,29 @@ class AuthFlow:
 
     # ── Step 4: OAuth 初始化 & 获取 device_id ──
     def auth_oauth_init(self, auth_url: str) -> str:
+        """跟随 authorize 链，落 authorize 会话状态并取回 oai-did。
+
+        这一步**建立的就是后面 authorize/continue 要用的那个 state**，头不像真
+        浏览器就拿不到有效状态，下一步必 409 invalid_state。
+
+        旧实现只发 Accept/Referer/UA，缺 client hints、**整组 Sec-Fetch-* 也没有**
+        （真浏览器跳转必带 document/navigate/cross-site）。2026-08-10 实测 A/B
+        对照各 6 轮（400 invalid_username 视为会话正常，只是 .test 域名被拒）：
+
+            A 现状裸头        会话正常 2/6，**409 = 3**
+            B 补齐 CH+SecFetch 会话正常 5/6，**409 = 0**
+
+        和 warmup 那处是同一个病（详见 warmup docstring），当时只修了 warmup，
+        漏了这里，所以主人实跑仍 409。头统一从 _navigation_headers 派生，
+        保证 client hints 与 self._fingerprint / self._ua 同族。
+        """
         logger.info("[3/10] OAuth 初始化...")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://chatgpt.com/auth/login",
-            "User-Agent": self._ua,
-        }
+        headers = self._navigation_headers()
+        headers["Referer"] = "https://chatgpt.com/"
+        # chatgpt.com -> auth.openai.com 是跨站跳转，不是首次直达
+        headers["sec-fetch-site"] = "cross-site"
+        # 302 自动跟随不是用户手动点击，真浏览器此时不发 sec-fetch-user
+        headers.pop("sec-fetch-user", None)
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
 
@@ -2113,7 +2271,38 @@ class AuthFlow:
         except Exception:
             return {}
 
-    # ── Step 8: 验证 OTP ──
+    @staticmethod
+    def _is_mfa_challenge_state(page_type: str = "", continue_url: str = "") -> bool:
+        if page_type and "mfa" in page_type.lower():
+            return True
+        if continue_url and "/mfa-challenge/" in continue_url:
+            return True
+        return False
+
+    def submit_mfa_totp(self, totp_code: str, challenge_id: str) -> dict:
+        """提交 TOTP 码完成 2FA 验证。"""
+        headers = self._common_headers("https://auth.openai.com/mfa-challenge")
+        headers["Content-Type"] = "application/json"
+        if self._last_sentinel_token:
+            headers["openai-sentinel-token"] = self._last_sentinel_token
+        # 2026-08-30 实测修正：旧端点 /api/accounts/mfa-challenge/{id}/verify 已 404，
+        # 正确端点是 /api/accounts/mfa/verify，body 用 {type:"totp", id:<factor_id>, code:<totp>}
+        resp = self.session.post(
+            "https://auth.openai.com/api/accounts/mfa/verify",
+            headers=headers,
+            json={"type": "totp", "id": challenge_id, "code": totp_code},
+            timeout=30,
+        )
+        self._trace_http("submit_mfa_totp", resp)
+        if resp.status_code != 200:
+            body = (resp.text or "")[:200]
+            logger.warning(f"TOTP 验证失败: {resp.status_code} - {body}")
+            return {"continue_url": ""}
+        try:
+            return resp.json()
+        except Exception:
+            return {"continue_url": ""}
+
     def verify_otp(self, otp_code: str) -> dict:
         logger.info("[7/10] 验证 OTP...")
         headers = self._common_headers("https://auth.openai.com/email-verification")
@@ -2926,6 +3115,25 @@ class AuthFlow:
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
                 )
 
+                # ── mfa-challenge 分支（密码验证后需要 TOTP 2FA）──
+                if self._is_mfa_challenge_state("", continue_url):
+                    totp_secret = (self.result.totp_secret or "").strip()
+                    if not totp_secret and self._account_callback:
+                        try:
+                            cred = self._account_callback(email)
+                            if cred and cred.get("totp_secret"):
+                                totp_secret = cred["totp_secret"]
+                                self.result.totp_secret = totp_secret
+                        except Exception:
+                            pass
+                    if totp_secret:
+                        challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                        if challenge_id:
+                            totp_code = _totp_now(totp_secret)
+                            mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                            continue_url = self._normalize_continue_url(
+                                (mfa_resp or {}).get("continue_url", "") if isinstance(mfa_resp, dict) else ""
+                            )
                 # 部分账号密码校验后仍需 email otp（二次校验）
                 if not continue_url or "/email-verification" in continue_url:
                     # password/verify 后推荐使用 resend，而不是 /email-otp/send
@@ -3094,14 +3302,30 @@ class AuthFlow:
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
                 self.oauth_secondary_authorize_exchange()
-            # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
-            if not refresh_only_mode:
+            # 最终再拉一次 session（仅当首次未拿全凭证或 Codex 流程拿到 RT 可能更新
+            # cookie 时；正常成功路径首次已拿全，避免无谓第二次请求，2026-09-16 优化）
+            if not refresh_only_mode and (not self.result.is_valid() or self.result.refresh_token):
                 self.get_auth_session()
 
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):
                 raise RuntimeError("流程完成但未获取 refresh_token/access_token")
         elif not self.result.is_valid():
+            # 2026-09-16: 账号已创建成功 + 密码已设置（密码注册流程 5.5/10），仅 NextAuth
+            # session 未建立（callback 校验偶发失败，修复前 30%/修复后 ~15% 概率）→
+            # 密码登录兜底一次，避免白烧邮箱/DDG 子号。
+            # 实测：修复后的失败号密码有效（登录分支 email_otp_verification），
+            # 兜底可拿回 access_token/session_token（rescue_v2.py 验证通过）。
+            if getattr(self.result, "password", ""):
+                try:
+                    logger.info("注册完成但 session 未建立，尝试密码登录兜底 ...")
+                    self.run_protocol_login(mail_provider, self.result.email, self.result.password)
+                    if self.result.is_valid():
+                        logger.info("密码登录兜底成功，凭证已补齐")
+                        return self.result
+                    logger.warning("密码登录兜底完成但仍无有效凭证")
+                except Exception as _e:
+                    logger.warning("密码登录兜底失败: %s: %s", type(_e).__name__, str(_e)[:200])
             raise RuntimeError("注册完成但未获取有效凭证")
 
         logger.info("注册流程完成!")
@@ -3181,6 +3405,26 @@ class AuthFlow:
                     continue_url = self._normalize_continue_url(
                         self._extract_continue_url_from_step(login_resp)
                     )
+                    # ── mfa-challenge 分支（密码验证后需要 TOTP 2FA）──
+                    if self._is_mfa_challenge_state(page_type, continue_url):
+                        totp_secret = (self.result.totp_secret or "").strip()
+                        if not totp_secret and self._account_callback:
+                            try:
+                                cred = self._account_callback(email)
+                                if cred and cred.get("totp_secret"):
+                                    totp_secret = cred["totp_secret"]
+                                    self.result.totp_secret = totp_secret
+                            except Exception:
+                                pass
+                        if totp_secret:
+                            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                            if challenge_id:
+                                totp_code = _totp_now(totp_secret)
+                                mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                                page_type = (self._extract_page_type(mfa_resp) or "").lower()
+                                continue_url = self._normalize_continue_url(
+                                    self._extract_continue_url_from_step(mfa_resp)
+                                )
                 elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
                     logger.info("登录分支: email_otp_verification")
                     # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。

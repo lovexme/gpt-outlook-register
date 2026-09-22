@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 # 尝试使用 curl_cffi（推荐，自带 TLS 指纹模拟）
 try:
     from curl_cffi.requests import Session as CffiSession
+    from curl_cffi import CurlOpt
 
     _HAS_CFFI = True
     logger.debug("curl_cffi 可用，使用 TLS 指纹模拟")

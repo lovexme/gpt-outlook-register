@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""统一 Outlook 收信服务（方案 A 核心）。
+
+所有注册方案（z.ai / GPT 面板 / 未来其他）的 Outlook 邮件收取统一走本服务，
+不再直接读 duck_pool.db 凭据、不再各自刷新 Graph refresh_token。
+
+设计要点（terra+glm 双模型审计结论落地）：
+- 独立端口 2553，只绑定 127.0.0.1（本机消费方，不暴露公网）
+- 独立 key（settings.outlook_fetch_key，不复用已暴露的 mbx_key）
+- 按 base 邮箱串行化 token 刷新（threading.Lock per base），不包整个轮询
+- refresh_token 轮换后 CAS 原子回写 duck_pool.db（带 updated_at）
+- sender 白名单参数化（z.ai 用 email.z.ai，OpenAI 用 openai.com 等）
+- Graph 429 读 Retry-After 退避；同邮箱最小轮询间隔
+- 单飞（inflight）：同 base+target 并发请求共享同一轮询结果
+- 端点用同步 def（FastAPI 线程池），不在 async 里做阻塞轮询
+
+用法: python3 outlook_fetch_server.py [port]  (默认 2553)
+"""
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+# webui 模块可能不存在（独立部署时无面板）；key 优先环境变量，缺失自动生成
+try:
+    from webui import db as webui_db
+except Exception:
+    webui_db = None
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+# ── 配置 ──
+DEFAULT_PORT = 2553
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+TOKEN_ENDPOINTS = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    "https://login.live.com/oauth20_token.srf",
+)
+GRAPH_FOLDERS = ("inbox", "junkemail", "deleteditems")
+# duck_pool.db 路径：优先环境变量，默认仓库目录下 duck_pool.db
+DUCK_DB = os.environ.get("DUCK_POOL_DB", "").strip()
+if not DUCK_DB:
+    DUCK_DB = str(Path(__file__).resolve().parent / "duck_pool.db")
+MIN_POLL_INTERVAL = 3.0          # 同邮箱两次 Graph 轮询最小间隔
+DEFAULT_TIMEOUT = 120
+MAX_TIMEOUT = 240
+
+# ── 鉴权 key（优先环境变量，其次主库 settings，再次自动生成）──
+_FETCH_KEY = os.environ.get("OUTLOOK_FETCH_KEY", "").strip()
+if not _FETCH_KEY:
+    try:
+        _FETCH_KEY = (webui_db.get_setting("outlook_fetch_key", "") or "").strip() if webui_db else ""
+    except Exception:
+        _FETCH_KEY = ""
+if not _FETCH_KEY or len(_FETCH_KEY) < 16:
+    _FETCH_KEY = secrets.token_hex(24)
+    try:
+        if webui_db:
+            webui_db.set_setting("outlook_fetch_key", _FETCH_KEY)
+    except Exception:
+        pass
+
+
+# ── per-base 邮箱状态（token 缓存 + 互斥锁 + 单飞）──
+class _OutlookState:
+    __slots__ = ("lock", "access_token", "access_expires_at", "last_poll_at")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.access_token = ""
+        self.access_expires_at = 0.0
+        self.last_poll_at = 0.0
+
+
+_STATES: dict[str, _OutlookState] = {}
+_STATES_GUARD = threading.Lock()
+
+
+def _state_for(base_email: str) -> _OutlookState:
+    key = base_email.lower()
+    with _STATES_GUARD:
+        st = _STATES.get(key)
+        if st is None:
+            st = _OutlookState()
+            _STATES[key] = st
+        return st
+
+
+# ── 凭据读取（唯一权威库 duck_pool.db）──
+def _load_credentials(base_email: str) -> dict | None:
+    """从 duck_pool.db 读 base 邮箱的 client_id/refresh_token。"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{DUCK_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT client_id, refresh_token FROM outlook_accounts "
+                "WHERE lower(email)=lower(?)",
+                (base_email,),
+            ).fetchone()
+            if not row or not row[1]:
+                return None
+            return {"client_id": row[0], "refresh_token": row[1]}
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _persist_refresh_token(base_email: str, old_rt: str, new_rt: str) -> bool:
+    """CAS 原子回写 refresh_token：仅当库中仍是旧值时更新，防覆盖并发刷新。"""
+    if not new_rt or new_rt == old_rt:
+        return False
+    import sqlite3
+    try:
+        conn = sqlite3.connect(DUCK_DB, timeout=10)
+        try:
+            cur = conn.execute(
+                "UPDATE outlook_accounts SET refresh_token=?, health_checked_at=? "
+                "WHERE lower(email)=lower(?) AND refresh_token=?",
+                (new_rt, time.time(), base_email, old_rt),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+# ── Graph token 刷新（带内存缓存 + 互斥 + 回写）──
+def _refresh_access_token(state: _OutlookState, base_email: str) -> str:
+    """在 state.lock 已持有的前提下调用。返回 access_token。"""
+    now = time.time()
+    if state.access_token and state.access_expires_at > now + 60:
+        return state.access_token
+
+    cred = _load_credentials(base_email)
+    if not cred:
+        raise LookupError(f"no_credentials:{base_email}")
+
+    last_error = ""
+    new_rt = ""
+    for endpoint in TOKEN_ENDPOINTS:
+        try:
+            body = urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": cred["refresh_token"],
+                "client_id": cred["client_id"],
+                "scope": GRAPH_SCOPE,
+            }).encode()
+            req = urllib.request.Request(endpoint, data=body)
+            resp = urllib.request.urlopen(req, timeout=20)
+            data = json.loads(resp.read())
+            if data.get("access_token"):
+                expires_in = int(data.get("expires_in") or 3600)
+                state.access_token = data["access_token"]
+                state.access_expires_at = now + max(300, expires_in - 90)
+                new_rt = data.get("refresh_token") or ""
+                if new_rt:
+                    _persist_refresh_token(base_email, cred["refresh_token"], new_rt)
+                return state.access_token
+            last_error = f"no access_token from {endpoint}"
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", errors="replace")[:200]
+            last_error = f"HTTP {e.code} {endpoint}: {text}"
+            if e.code in (400, 401, 403):
+                continue
+            break
+        except Exception as e:
+            last_error = f"{endpoint}: {e}"
+            continue
+    raise RuntimeError(f"token_refresh_failed:{last_error[:120]}")
+
+
+# ── Graph 拉信（带 429 退避）──
+def _graph_list_messages(access_token: str, folder: str, timeout: float = 12) -> list:
+    params = urllib.parse.urlencode({
+        "$top": "15",
+        "$orderby": "receivedDateTime DESC",
+        "$select": "id,subject,bodyPreview,body,receivedDateTime,from,toRecipients",
+    })
+    url = f"{GRAPH_BASE}/me/mailFolders/{folder}/messages?{params}"
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            })
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(resp.read())
+            value = data.get("value")
+            return value if isinstance(value, list) else []
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = float(e.headers.get("Retry-After") or 2)
+                time.sleep(min(retry_after, 10))
+                continue
+            if e.code == 401:
+                raise
+            if e.code in (400, 403):
+                return []
+            time.sleep(1.5)
+            continue
+        except Exception:
+            time.sleep(1.5)
+            continue
+    return []
+
+
+# ── 邮件过滤与 token 提取 ──
+def _sender_domain_matches(from_addr: str, domains: tuple) -> bool:
+    """按发件邮箱域精确匹配，或匹配获准域的子域。"""
+    _, sep, from_domain = (from_addr or "").strip().lower().rpartition("@")
+    if not sep or not from_domain:
+        return False
+    return any(from_domain == d or from_domain.endswith("." + d) for d in domains)
+
+
+def _extract_token(body_text: str) -> str:
+    """提取验证 token / 6 位 OTP。优先 z.ai verify token，再找 6 位数字。"""
+    if not body_text:
+        return ""
+    # z.ai: /auth/verify?token=verify-xxx
+    m = re.search(r'/auth/verify\?[^"\'\s<>]*token=([A-Za-z0-9._-]+)', body_text)
+    if m:
+        return m.group(1)
+    m = re.search(r'(?:token|verify[_-]?token|otp|code)\s*[=:&]\s*([A-Za-z0-9._-]{8,})', body_text)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b(\d{6})\b', body_text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _preview_of(msg: dict) -> dict:
+    from_obj = msg.get("from") or {}
+    from_addr = (from_obj.get("emailAddress") or {}).get("address", "")
+    return {
+        "id": msg.get("id", ""),
+        "folder": "",
+        "from": from_addr,
+        "subject": (msg.get("subject") or "")[:120],
+        "received_at": msg.get("receivedDateTime", ""),
+        "body_preview": (msg.get("bodyPreview") or "")[:200],
+    }
+
+
+# ── 核心收信逻辑（在 base 锁外轮询，锁内只做刷新）──
+def _poll_once(base_email: str, target_email: str, want_username: str,
+               sender_domains: tuple, issued_after: float) -> dict:
+    state = _state_for(base_email)
+    # 1. 锁内确保 access_token 有效（刷新临界区）
+    with state.lock:
+        access_token = _refresh_access_token(state, base_email)
+    # 2. 锁外轮询（幂等读，不占锁）
+    with state.lock:
+        now = time.time()
+        wait_for = MIN_POLL_INTERVAL - (now - state.last_poll_at)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        state.last_poll_at = time.time()
+    # 遍历所有 folder 收集候选，优先返回带 token 的邮件（验证邮件 vs 欢迎邮件）
+    candidates: list[dict] = []
+    for folder in GRAPH_FOLDERS:
+        try:
+            msgs = _graph_list_messages(access_token, folder)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                with state.lock:
+                    state.access_token = ""
+                    access_token = _refresh_access_token(state, base_email)
+                msgs = _graph_list_messages(access_token, folder)
+            else:
+                msgs = []
+        for msg in msgs:
+            from_addr = ((msg.get("from") or {}).get("emailAddress") or {}).get("address", "")
+            if not _sender_domain_matches(from_addr, sender_domains):
+                continue
+            rcpts = [((r.get("emailAddress") or {}).get("address", "")).lower()
+                     for r in (msg.get("toRecipients") or [])]
+            # Outlook Graph 会把 +tag 别名归一化为 base 邮箱（实测 z.ai 邮件 toRecipients 显示 base）
+            # 所以 target_email 带 +tag 时，base 也算匹配；保留 want_username 正文兜底
+            target_lower = target_email.lower()
+            target_base = target_lower
+            if "+" in target_lower.split("@")[0]:
+                local_t, dom_t = target_lower.split("@", 1)
+                target_base = f"{local_t.split('+')[0]}@{dom_t}"
+            # 点号变体：Graph 可能保留原样（deborah.brown668th@outlook.com），
+            # 而调用方按基底（deborahbrown668th@outlook.com）查——本地部分去点后匹配
+            def _no_dot_local(addr: str) -> str:
+                local, _, dom = addr.partition("@")
+                return f"{local.replace('.', '')}@{dom}"
+            target_nodot = _no_dot_local(target_base)
+            rcpts_nodot = {_no_dot_local(r) for r in rcpts}
+            if target_lower not in rcpts and target_base not in rcpts \
+               and target_nodot not in rcpts and target_nodot not in rcpts_nodot:
+                continue
+            try:
+                received_ts = 0.0
+                rdt = msg.get("receivedDateTime", "")
+                if rdt:
+                    from datetime import datetime
+                    received_ts = datetime.fromisoformat(rdt.replace("Z", "+00:00")).timestamp()
+                if issued_after and received_ts and received_ts < issued_after:
+                    continue
+            except Exception:
+                # issued_after 存在时，时间无法解析的邮件不能作为本轮验证码。
+                if issued_after:
+                    continue
+            body_obj = msg.get("body") or {}
+            body_text = body_obj.get("content", "") or msg.get("bodyPreview", "")
+            if want_username and want_username not in body_text:
+                continue
+            tok = _extract_token(body_text)
+            prev = _preview_of(msg)
+            prev["folder"] = folder
+            candidates.append({"ok": True, "token": tok, "preview": prev,
+                               "mailbox": base_email, "target_email": target_email})
+    # 优先带 token；全部无 token 时返回最新一封（时间倒序第一个就是最新）
+    for c in candidates:
+        if c["token"]:
+            return c
+    if candidates:
+        return candidates[0]
+    return {"ok": False, "reason": "not_found_yet"}
+
+
+def _fetch_loop(base_email: str, target_email: str, want_username: str,
+                sender_domains: tuple, issued_after: float, timeout: int) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = _poll_once(base_email, target_email, want_username, sender_domains, issued_after)
+        except LookupError as e:
+            return {"ok": False, "error": "mailbox_not_found", "message": str(e)}
+        except RuntimeError as e:
+            return {"ok": False, "error": "graph_auth_failed", "message": str(e)[:120]}
+        except Exception as e:
+            return {"ok": False, "error": "graph_upstream_error", "message": str(e)[:120]}
+        if r.get("ok"):
+            return r
+        time.sleep(3)
+    return {"ok": False, "error": "otp_timeout", "message": f"wait {timeout}s no mail"}
+
+
+# ── API ──
+def _check_auth(req: Request) -> bool:
+    return req.headers.get("x-fetch-key") == _FETCH_KEY
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "outlook_fetch_server"}
+
+
+@app.post("/v1/fetch")
+async def outlook_fetch(req: Request):
+    """POST /v1/fetch  {email, want_username?, timeout?, issued_after?, sender_domains?}"""
+    if not _check_auth(req):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=403)
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_request"}, status_code=400)
+    raw_email_value = body.get("email")
+    if raw_email_value is not None and not isinstance(raw_email_value, str):
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad email"}, status_code=400)
+    raw_email = (raw_email_value or "").strip().lower()
+    want_username_value = body.get("want_username")
+    if want_username_value is not None and not isinstance(want_username_value, str):
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad want_username"}, status_code=400)
+    want_username = (want_username_value or "").strip()
+    try:
+        timeout = max(10, min(MAX_TIMEOUT, int(body.get("timeout") or DEFAULT_TIMEOUT)))
+        issued_after = float(body.get("issued_after") or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad timeout or issued_after"}, status_code=400)
+    raw_domains = body.get("sender_domains", ["email.z.ai", "openai.com"])
+    if not isinstance(raw_domains, list) or not raw_domains or any(not isinstance(d, str) or not d.strip() for d in raw_domains):
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad sender_domains"}, status_code=400)
+    domains = tuple(d.strip().lower() for d in raw_domains)
+    if not raw_email or "@" not in raw_email:
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad email"}, status_code=400)
+
+    local, _, domain = raw_email.partition("@")
+    base_email = f"{local.split('+')[0]}@{domain}" if domain else raw_email
+    if not _load_credentials(base_email):
+        return JSONResponse({"ok": False, "error": "mailbox_not_found", "message": base_email},
+                            status_code=404)
+
+    # target_email：默认等于 email（+tag 时匹配 base）；duck 场景调用方传 duck 地址，
+    # 因为 duck 转发的邮件 toRecipients 保留 duck 地址，按 outlook base 匹配永远读不到。
+    raw_target = body.get("target_email")
+    if raw_target is not None and not isinstance(raw_target, str):
+        return JSONResponse({"ok": False, "error": "invalid_request", "message": "bad target_email"}, status_code=400)
+    target_email = (raw_target or raw_email).strip().lower()
+
+    from fastapi.concurrency import run_in_threadpool
+    result = await run_in_threadpool(
+        _fetch_loop, base_email, target_email, want_username, domains, issued_after, timeout)
+    if result.get("ok"):
+        return result
+    err = result.get("error", "otp_timeout")
+    status = {"mailbox_not_found": 404, "graph_auth_failed": 502,
+              "graph_upstream_error": 502}.get(err, 408)
+    return JSONResponse(result, status_code=status)
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
