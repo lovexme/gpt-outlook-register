@@ -42,6 +42,37 @@ def _gen_local_part(rng: Optional[random.Random] = None, length: int = 10) -> st
 # 保留旧名给可能的外部调用。
 _extract_otp = extract_otp
 
+# 2026-09-28：DDG 静默拒发域（实测发信被 DDG 拒收；duck.py 同源注释 101122.xyz 被拒发）。
+# 只影响新邮箱创建轮询；旧账号读信按具体地址查询 /admin/mails 不受影响。
+DDG_REJECT_CF_DOMAINS = {"101122.xyz"}
+
+
+def _decode_raw_body(raw: str) -> str:
+    """quoted-printable 邮件正文解码。
+
+    cf_temp 的 raw 常带 Content-Transfer-Encoding: quoted-printable，
+    不解码时 OpenAI 模板的软换行/编码字符会卡 OTP 提取（2026-09-28 实测）。
+    解析失败回退原文。
+    """
+    if not raw:
+        return raw
+    try:
+        from email import message_from_string
+        msg = message_from_string(raw)
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() in ("text/plain", "text/html"):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        return payload.decode(part.get_content_charset() or "utf-8", "replace")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                return payload.decode(msg.get_content_charset() or "utf-8", "replace")
+    except Exception:
+        pass
+    return raw
+
 
 # 域名轮询计数器（进程级）
 _DOMAIN_INDEX = [0]
@@ -147,6 +178,14 @@ class CFTempEmailProvider(MailProvider):
             )
         if not domains:
             domains = [domain]
+        # 2026-09-28：排除 DDG 拒发域（新邮箱创建别用；读信不受影响）。
+        # 101122.xyz 曾实测被 DDG 静默拒发，用了新邮箱永远收不到确认信。
+        domains = [d for d in domains if d not in DDG_REJECT_CF_DOMAINS]
+        if not domains:
+            raise RuntimeError(
+                "CF Temp Email 所有配置域名均被 DDG 拒发（101122.xyz），"
+                "请先在「邮箱配置」添加可用 catch-all 域名"
+            )
         token = (settings.get("cf_admin_token") or "").strip()
         if not api_url:
             raise RuntimeError(
@@ -287,21 +326,29 @@ class CFTempEmailProvider(MailProvider):
         return email
 
     def _get_mails(self, email: str) -> list:
-        """拉指定邮箱的最新邮件列表（默认 limit=20）。"""
-        resp = self._request(
-            "GET", "/admin/mails",
-            params={"limit": 20, "offset": 0, "address": email},
-            timeout=10,
-        )
-        status = getattr(resp, "status_code", 0)
-        if status != 200:
-            logger.debug(f"[cf_temp] /admin/mails 返回 {status}")
-            return []
-        data = self._parse_json(resp)
-        if isinstance(data, dict):
-            return data.get("results") or data.get("mails") or []
-        if isinstance(data, list):
-            return data
+        """拉指定邮箱的最新邮件列表（默认 limit=20）。网络抖动有限重试。"""
+        last_status = 0
+        for attempt in range(3):
+            try:
+                resp = self._request(
+                    "GET", "/admin/mails",
+                    params={"limit": 20, "offset": 0, "address": email},
+                    timeout=10,
+                )
+                status = getattr(resp, "status_code", 0)
+                if status == 200:
+                    data = self._parse_json(resp)
+                    if isinstance(data, dict):
+                        return data.get("results") or data.get("mails") or []
+                    if isinstance(data, list):
+                        return data
+                    return []
+                last_status = status
+            except Exception as e:
+                logger.warning(f"[cf_temp] /admin/mails attempt{attempt + 1} 异常: {e}")
+            if attempt < 2:
+                time.sleep(1.5)
+        logger.debug(f"[cf_temp] /admin/mails 重试后仍失败 status={last_status}")
         return []
 
     def wait_for_otp(
@@ -329,9 +376,13 @@ class CFTempEmailProvider(MailProvider):
                 if not mid:
                     continue
                 self._seen_mail_ids.add(mid)
-                # 初始拉取时邮件可能已经到达，必须提取 OTP 不能只加 seen
+                # 初始拉取时邮件可能已经到达，必须提取 OTP 不能只加 seen。
+                # 2026-09-28：同时必须满足 issued_after 时间窗——旧代码直接提取
+                # 会把历史旧码当本轮码提交，产生假成功。
+                if not message_is_after(m, issued_after):
+                    continue
                 raw = str(m.get("raw") or "")
-                otp = extract_otp(raw)
+                otp = extract_otp(_decode_raw_body(raw))
                 if otp:
                     logger.info(f"[cf_temp] ✅ OTP={otp} from mail id={mid} (初始拉取)")
                     return otp
@@ -352,7 +403,7 @@ class CFTempEmailProvider(MailProvider):
                     if not message_is_after(mail, issued_after):
                         continue
                     raw = str(mail.get("raw") or "")
-                    otp = extract_otp(raw)
+                    otp = extract_otp(_decode_raw_body(raw))
                     if otp:
                         logger.info(
                             f"[cf_temp] ✅ OTP={otp} from mail id={mid} "

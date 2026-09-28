@@ -48,6 +48,21 @@ GRAPH_FOLDERS = ["inbox", "junkemail", "deleteditems"]
 
 IMAP_SERVERS = ["outlook.live.com", "outlook.office365.com"]
 
+# 2026-09-28：Hotmail 域白名单（与 outlook 池隔离，防 hotmail 号被 outlook 源混提）。
+# 覆盖 duck_pool 同名单 + 审查发现的常见国家域（co.jp/nl/se/com.au）。
+HOTMAIL_DOMAINS = {
+    "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de",
+    "hotmail.es", "hotmail.it", "hotmail.com.br", "hotmail.com.ar",
+    "hotmail.co.jp", "hotmail.nl", "hotmail.se", "hotmail.com.au",
+    "hotmail.ca", "hotmail.co.nz", "hotmail.dk", "hotmail.fi",
+    "hotmail.no", "hotmail.pl", "hotmail.pt", "hotmail.ru",
+    "hotmail.com.tr", "hotmail.co.kr", "hotmail.co.in", "hotmail.com.my",
+    "hotmail.com.sg", "hotmail.com.ph", "hotmail.co.za", "hotmail.co.il",
+    "hotmail.com.mx", "hotmail.com.co", "hotmail.cl", "hotmail.com.pe",
+    "hotmail.com.hk", "hotmail.com.tw", "hotmail.hu", "hotmail.cz",
+    "hotmail.sk", "hotmail.gr", "hotmail.ro", "hotmail.bg",
+}
+
 _FROM_DOMAINS = ("openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open",
                  "forwarded-by@duck.com")
 
@@ -545,12 +560,12 @@ class OutlookMailProvider(MailProvider):
     """
 
     kind = "outlook"
-    display_name = "Outlook 接码池"
+    display_name = "Outlook/Hotmail 接码池"
     pooled = True          # 号是买来的，用完/废了要换下一个
     ephemeral = False      # 地址固定，OpenAI 可能识别为已有账号
 
     line_segments = 4
-    import_hint = "每行一个：email----password----client_id----refresh_token"
+    import_hint = "支持 @hotmail/@outlook/@live/@msn；每行一个：email----password----client_id----refresh_token"
     import_placeholder = "xxx@hotmail.com----Pass123----9e5f94bc-xxxx----M.C5xx_xxx"
 
     config_fields: list[ConfigField] = []   # 凭证来自号池，无全局配置
@@ -596,12 +611,16 @@ class OutlookMailProvider(MailProvider):
             raise ValueError("client_id 为空")
         if len(refresh) < 20:
             raise ValueError(f"refresh_token 太短（{len(refresh)} 字符，至少 20）")
+        # 2026-09-28：Hotmail 域自动分类 kind='hotmail'，与 outlook 池隔离。
+        # 否则 hotmail 号会被 outlook 源混提（审查确认：import 前无隔离）。
+        dom = email.lower().split("@")[-1]
+        row_kind = "hotmail" if dom in HOTMAIL_DOMAINS else cls.kind
         return {
             "email": email.lower(),
             "password": password,
             "client_id": client_id,
             "refresh_token": refresh,
-            "kind": cls.kind,
+            "kind": row_kind,
         }
 
     # ── 号池语义 ─────────────────────────────────────────
@@ -677,4 +696,20 @@ class OutlookMailProvider(MailProvider):
                     f"Graph 先前错误: {type(graph_error).__name__}: {graph_error}"
                 )
             raise
+
+
+# ──────────────────────── Hotmail 隔离池 ────────────────────────
+
+@register
+class HotmailMailProvider(OutlookMailProvider):
+    """Hotmail 域专用 provider（kind='hotmail'，与 outlook 池隔离）。
+
+    2026-09-28：Hotmail 号与 Outlook 号必须分开 claim——
+    否则 outlook 源会把 hotmail 号混提走（审查确认：此前无隔离）。
+    除 kind/display_name 外完全复用 Outlook 的 Graph/IMAP 读信逻辑。
+    """
+
+    kind = "hotmail"
+    display_name = "Hotmail 接码池"
+    import_hint = "支持 @hotmail/@live 域；每行一个：email----password----client_id----refresh_token"
 
